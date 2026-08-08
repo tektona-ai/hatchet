@@ -399,14 +399,26 @@ that published has already moved on. This is the same guarantee the RabbitMQ
 backend gives — it publishes without confirms — so the engine is built for it.
 It is nonetheless weaker than this backend's default, which is why it is opt-in.
 
-Enable it if you are publish-bound, particularly when NATS is a network hop away
-rather than a sidecar. Note that publish throughput is not always what limits
-end-to-end task throughput; measure before enabling.
+Measure before enabling it, because publishing is usually not what limits task
+throughput. On a single-node setup with NATS on loopback, turning it on moved
+end-to-end task throughput from 325 to 347 tasks/second across three runs each —
+inside the run-to-run spread, despite the 19x on the publish path itself. The
+queue simply was not the bottleneck: that deployment asked about 1,000
+messages/second of a backend that drains 50,000.
+
+It is worth enabling when publishing is genuinely the constraint. The clearest
+case is a NATS server that is a network hop away rather than a sidecar, since
+synchronous publishing costs one round trip per message and therefore degrades
+in direct proportion to the round-trip time, while pipelined publishing does
+not.
 
 Batch publishing (NATS 2.12+ atomic batches, 2.14+ fast ingest) is deliberately
-not used. Published figures put async publishing at or above atomic batching,
-and Hatchet sends one message per call, so there is no batch to form without
-duplicating the buffering the engine already does above this layer.
+not used. Published figures put async publishing at or above atomic batching, so
+the batching itself buys nothing here; the large numbers quoted for fast ingest
+come from pairing it with a stream in `persist_mode: async`, which is a separate
+setting that trades away more durability. Hatchet also sends one message per
+call, so there is no batch to form without duplicating the buffering the engine
+already does above this layer.
 
 #### Behavioral differences from RabbitMQ
 
