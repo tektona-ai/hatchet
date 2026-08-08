@@ -293,7 +293,7 @@ Variables marked with ⚠️ are conditionally required when specific features a
 
 | Variable                                            | Description                                                                                                | Default Value    |
 | --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- | ---------------- |
-| `SERVER_MSGQUEUE_KIND`                              | Message queue kind (`rabbitmq` or `postgres`)                                                              | `rabbitmq`       |
+| `SERVER_MSGQUEUE_KIND`                              | Message queue kind (`rabbitmq`, `postgres`, or `nats`)                                                     | `rabbitmq`       |
 | `SERVER_MSGQUEUE_RABBITMQ_URL`                      | RabbitMQ URL                                                                                               |                  |
 | `SERVER_MSGQUEUE_RABBITMQ_QOS`                      | RabbitMQ QoS (prefetch count)                                                                              | `100`            |
 | `SERVER_MSGQUEUE_RABBITMQ_MAX_PUB_CHANS`            | Max RabbitMQ publish channels                                                                              | `20`             |
@@ -302,6 +302,17 @@ Variables marked with ⚠️ are conditionally required when specific features a
 | `SERVER_MSGQUEUE_RABBITMQ_COMPRESSION_THRESHOLD`    | Byte size above which messages are compressed                                                              | `5120`           |
 | `SERVER_MSGQUEUE_RABBITMQ_ENABLE_MESSAGE_REJECTION` | Reject (rather than requeue) messages past the max death count                                             | `false`          |
 | `SERVER_MSGQUEUE_RABBITMQ_MAX_DEATH_COUNT`          | Max redeliveries before a message is dead-lettered                                                         | `1000`           |
+| `SERVER_MSGQUEUE_NATS_URL`                          | NATS seed URL(s), comma-separated for a cluster (requires JetStream)                                       |                  |
+| `SERVER_MSGQUEUE_NATS_USERNAME`                     | NATS username (sent as a connect option, so reconnects also authenticate)                                  |                  |
+| `SERVER_MSGQUEUE_NATS_PASSWORD`                     | NATS password (see username)                                                                               |                  |
+| `SERVER_MSGQUEUE_NATS_SUBJECT_PREFIX`               | NATS subject prefix for durable queues, joined to queue names with `.`                                     | `hatchet.mq`     |
+| `SERVER_MSGQUEUE_NATS_STREAM_PREFIX`                | Prefix for the JetStream streams Hatchet creates                                                           | `HATCHET`        |
+| `SERVER_MSGQUEUE_NATS_QOS`                          | NATS QoS, applied as the consumer's `MaxAckPending`                                                        | `100`            |
+| `SERVER_MSGQUEUE_NATS_COMPRESSION_ENABLED`          | Enable gzip compression of messages                                                                        | `false`          |
+| `SERVER_MSGQUEUE_NATS_COMPRESSION_THRESHOLD`        | Byte size above which messages are compressed                                                              | `5120`           |
+| `SERVER_MSGQUEUE_NATS_ENABLE_MESSAGE_REJECTION`     | Stop redelivering messages past the max death count                                                        | `false`          |
+| `SERVER_MSGQUEUE_NATS_MAX_DEATH_COUNT`              | Max redeliveries before a message is rejected                                                              | `1000`           |
+| `SERVER_MSGQUEUE_NATS_ASYNC_PUBLISH`                | Pipeline publishes instead of awaiting a server ack per message (see below)                                | `false`          |
 | `SERVER_MSGQUEUE_PUBSUB_KIND`                       | Pub/sub kind: `rabbitmq`, `postgres`, or `nats` (inherits `SERVER_MSGQUEUE_KIND` when unset)               |                  |
 | `SERVER_MSGQUEUE_PUBSUB_RABBITMQ_URL`               | Pub/sub RabbitMQ URL (inherits `SERVER_MSGQUEUE_RABBITMQ_URL` when unset; always uses its own connections) |                  |
 | `SERVER_MSGQUEUE_PUBSUB_RABBITMQ_MAX_PUB_CHANS`     | Pub/sub RabbitMQ max publish channels                                                                      | `10`             |
@@ -314,25 +325,122 @@ Variables marked with ⚠️ are conditionally required when specific features a
 | `SERVER_MSGQUEUE_PUBSUB_NATS_SUBJECT_PREFIX`        | Pub/sub NATS subject prefix, joined to topic names with `.`                                                | `hatchet.pubsub` |
 | `SERVER_SINGLE_QUEUE_LIMIT`                         | Single queue limit                                                                                         | `100`            |
 
-### NATS Pub/Sub
+### NATS
 
-NATS is available for the best-effort pub/sub only; durable task queues stay on
-RabbitMQ or Postgres. It uses core NATS (no JetStream), so delivery is
-at-most-once.
+NATS can back either half of Hatchet's messaging, and the two halves are
+configured independently:
+
+- **Durable task queues** (`SERVER_MSGQUEUE_KIND=nats`) run on JetStream, which
+  must be enabled on the server. Delivery is at-least-once with explicit acks.
+- **Best-effort pub/sub** (`SERVER_MSGQUEUE_PUBSUB_KIND=nats`) uses core NATS,
+  no JetStream required. Delivery is at-most-once.
+
+Setting `SERVER_MSGQUEUE_KIND=nats` makes the pub/sub default to NATS too, and
+it inherits the durable queue's URL and credentials, so a NATS-only deployment
+needs just:
+
+```
+SERVER_MSGQUEUE_KIND=nats
+SERVER_MSGQUEUE_NATS_URL=nats://nats:4222
+```
+
+The two halves use different subject namespaces (`hatchet.mq` and
+`hatchet.pubsub`) and always open separate connections, so one NATS server can
+carry both.
+
+#### Server requirements
 
 The NATS server must be configured with `max_payload: 16777216` (16MiB). Task
 stream events routinely exceed the NATS default of 1MiB, and Hatchet refuses to
 start against a server advertising a smaller limit rather than failing later on
 an oversized publish.
 
-Prefer bare hosts in `SERVER_MSGQUEUE_PUBSUB_NATS_URL` and set the username and
-password separately. Credentials embedded in the URL are not reapplied when the
-client reconnects to a cluster peer it learned about through gossip.
+For the durable queue, JetStream must be enabled and sized for your task
+backlog. Hatchet creates one work-queue-retention stream per queue, so a stream
+holds every message that has not yet been acked; a stalled consumer is bounded
+by `max_file_store` rather than by memory.
+
+Prefer bare hosts in the URL and set the username and password separately.
+Credentials embedded in the URL are not reapplied when the client reconnects to
+a cluster peer it learned about through gossip.
+
+#### Isolating installations
 
 Unlike the other backends, which isolate installations at the connection level
 (a RabbitMQ vhost, a Postgres database), NATS isolates by subject. Set
-`SERVER_MSGQUEUE_PUBSUB_NATS_SUBJECT_PREFIX` to keep installations that share a
-NATS server from seeing each other's messages.
+`SERVER_MSGQUEUE_PUBSUB_NATS_SUBJECT_PREFIX` and
+`SERVER_MSGQUEUE_NATS_SUBJECT_PREFIX` to keep installations that share a NATS
+server from seeing each other's messages.
+
+Streams are a separate, flat namespace per NATS account, and the subject prefix
+does not keep them apart. Two installations sharing an account must also set
+different `SERVER_MSGQUEUE_NATS_STREAM_PREFIX` values, or they will collide on
+stream names.
+
+#### Publish throughput
+
+By default every publish waits for JetStream to acknowledge it, so a successful
+send means the message is persisted. That costs one network round trip per
+message — measured at ~250µs against a loopback server, and proportionally more
+against a real network — and the engine publishes from several serial loops
+(task assignment, event ingest) that were written against RabbitMQ, where a
+publish is an unconfirmed socket write.
+
+Setting `SERVER_MSGQUEUE_NATS_ASYNC_PUBLISH=true` pipelines those publishes
+instead, which measured ~19x on the publish path (3.6k to 70k messages/second
+for a single serial publisher on loopback). Publishes remain bounded so a broker
+that stops acknowledging applies backpressure rather than growing the engine's
+memory without limit.
+
+The trade is what a successful send means: with async publishing it means the
+client has accepted the message, not that the server has stored it. A rejection
+that arrives afterwards is logged and marks the queue unhealthy, but the code
+that published has already moved on. This is the same guarantee the RabbitMQ
+backend gives — it publishes without confirms — so the engine is built for it.
+It is nonetheless weaker than this backend's default, which is why it is opt-in.
+
+Measure before enabling it, because publishing is usually not what limits task
+throughput. On a single-node setup with NATS on loopback, turning it on moved
+end-to-end task throughput from 325 to 347 tasks/second across three runs each —
+inside the run-to-run spread, despite the 19x on the publish path itself. The
+queue simply was not the bottleneck: that deployment asked about 1,000
+messages/second of a backend that drains 50,000.
+
+It is worth enabling when publishing is genuinely the constraint. The clearest
+case is a NATS server that is a network hop away rather than a sidecar, since
+synchronous publishing costs one round trip per message and therefore degrades
+in direct proportion to the round-trip time, while pipelined publishing does
+not.
+
+Batch publishing (NATS 2.12+ atomic batches, 2.14+ fast ingest) is deliberately
+not used. Published figures put async publishing at or above atomic batching, so
+the batching itself buys nothing here; the large numbers quoted for fast ingest
+come from pairing it with a stream in `persist_mode: async`, which is a separate
+setting that trades away more durability. Hatchet also sends one message per
+call, so there is no batch to form without duplicating the buffering the engine
+already does above this layer.
+
+#### Behavioral differences from RabbitMQ
+
+The durable queue matches the RabbitMQ backend's observable behavior, but
+reaches it through JetStream primitives rather than AMQP ones:
+
+- **Retries.** RabbitMQ parks a failed message in a pair of ping-ponging
+  dead-letter queues to apply the backoff. JetStream expresses this directly, so
+  a failed message is redelivered on the same consumer after the backoff and
+  there are no automatic dead-letter queues to observe.
+- **Publishes are confirmed.** JetStream acknowledges every publish, so a
+  successful `SendMessage` means the message is persisted. The RabbitMQ backend
+  publishes without confirms.
+- **Dispatcher message expiry.** RabbitMQ has the broker enforce the dispatcher
+  queue's 20-second message TTL via a dead-letter exchange. JetStream has no
+  equivalent, so the deadline is enforced when the message is delivered: an
+  expired message is routed to the dispatcher dead-letter queue instead of being
+  handled. A message that no consumer ever receives — because the dispatcher is
+  gone entirely — is dropped when the stream ages it out, and the affected tasks
+  are recovered by the engine's reassignment and timeout paths rather than
+  through the dead-letter queue. This matches the Postgres backend, which also
+  approximates this behavior.
 
 ### Message Queue Buffers
 
