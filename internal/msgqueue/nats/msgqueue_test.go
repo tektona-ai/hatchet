@@ -25,7 +25,7 @@ import (
 // gets its own stream and subject prefixes and deletes its streams on the way
 // out. Without that, a queue name reused across tests would let one test
 // consume another's backlog.
-func newTestMQ(t *testing.T, opts ...MessageQueueOpt) *MessageQueue {
+func newTestMQ(t testing.TB, opts ...MessageQueueOpt) *MessageQueue {
 	t.Helper()
 
 	ns := strings.ReplaceAll(uuid.NewString(), "-", "")[:16]
@@ -51,7 +51,7 @@ func newTestMQ(t *testing.T, opts ...MessageQueueOpt) *MessageQueue {
 	return mq
 }
 
-func deleteStreams(t *testing.T, prefix string) {
+func deleteStreams(t testing.TB, prefix string) {
 	t.Helper()
 
 	nc, err := natsgo.Connect(testNATSURL)
@@ -75,7 +75,7 @@ func deleteStreams(t *testing.T, prefix string) {
 	}
 }
 
-func streamNames(t *testing.T, prefix string) []string {
+func streamNames(t testing.TB, prefix string) []string {
 	t.Helper()
 
 	nc, err := natsgo.Connect(testNATSURL)
@@ -99,7 +99,7 @@ func streamNames(t *testing.T, prefix string) []string {
 	return out
 }
 
-func testMessage(t *testing.T, id string) *msgqueue.Message {
+func testMessage(t testing.TB, id string) *msgqueue.Message {
 	t.Helper()
 
 	msg, err := msgqueue.NewTenantMessage(uuid.New(), id, false, true, map[string]interface{}{"key": id})
@@ -110,7 +110,7 @@ func testMessage(t *testing.T, id string) *msgqueue.Message {
 
 // waitFor polls until cond holds or the deadline passes, so tests assert on an
 // eventual state rather than sleeping for a fixed guess.
-func waitFor(t *testing.T, timeout time.Duration, msg string, cond func() bool) {
+func waitFor(t testing.TB, timeout time.Duration, msg string, cond func() bool) {
 	t.Helper()
 
 	deadline := time.Now().Add(timeout)

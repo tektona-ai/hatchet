@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	natsgo "github.com/nats-io/nats.go"
@@ -50,6 +51,12 @@ const (
 	// consumers. These are control-plane round trips, not data path.
 	provisionTimeout = 30 * time.Second
 
+	// defaultAsyncPublishMaxPending bounds how many un-acked publishes may be
+	// in flight before PublishAsync blocks. It is the backpressure valve for
+	// async publishing: without a bound, a broker that stops acking would let
+	// the engine buffer messages until it ran out of memory.
+	defaultAsyncPublishMaxPending = 4000
+
 	mb                       = 1024 * 1024
 	maxSizeErrorLogThreshold = 10 * mb
 )
@@ -84,6 +91,15 @@ type MessageQueue struct {
 	enableMessageRejection bool
 	maxDeathCount          int
 
+	// asyncPublish trades the per-publish ack round trip for pipelining; see
+	// WithAsyncPublish.
+	asyncPublish bool
+
+	// asyncPublishFailures counts publishes that were accepted by SendMessage
+	// but rejected by the server afterwards. In async mode this is the only
+	// signal such a loss happened, so it is surfaced through IsReady.
+	asyncPublishFailures atomic.Uint64
+
 	// provisioned memoizes ensureStream so the publish path does not make a
 	// JetStream API round trip per message.
 	provisioned sync.Map
@@ -107,6 +123,7 @@ type MessageQueueOpts struct {
 	compressionThreshold   int
 	enableMessageRejection bool
 	maxDeathCount          int
+	asyncPublish           bool
 }
 
 func defaultMessageQueueOpts() *MessageQueueOpts {
@@ -188,6 +205,29 @@ func WithExpirableMessageTTL(ttl time.Duration) MessageQueueOpt {
 	}
 }
 
+// WithAsyncPublish pipelines publishes instead of waiting for each server ack
+// before sending the next.
+//
+// A synchronous publish costs one full round trip per message, so a caller that
+// publishes in a loop pays that latency serially. The engine has several such
+// loops (task assignment, event ingest), written against the rabbitmq backend
+// where a publish is an unconfirmed socket write and effectively free. Async
+// publishing gives this backend the same cost model, which is worth roughly
+// 30x on the publish path.
+//
+// The trade is the meaning of a nil error from SendMessage: it becomes "handed
+// to the client, which will deliver it" rather than "the server has persisted
+// it". A server-side rejection after the fact is reported through the async
+// error handler and makes IsReady false, but the SendMessage caller has already
+// moved on. This is the same guarantee the rabbitmq backend gives today (it
+// publishes without confirms), which is why it is safe for the engine — but it
+// is weaker than this backend's synchronous default, so it is opt-in.
+func WithAsyncPublish(enabled bool) MessageQueueOpt {
+	return func(opts *MessageQueueOpts) {
+		opts.asyncPublish = enabled
+	}
+}
+
 func WithGzipCompression(enabled bool, threshold int) MessageQueueOpt {
 	return func(opts *MessageQueueOpts) {
 		opts.compressionEnabled = enabled
@@ -255,20 +295,12 @@ func New(fs ...MessageQueueOpt) (func() error, *MessageQueue, error) {
 		)
 	}
 
-	js, err := jetstream.New(nc)
-
-	if err != nil {
-		nc.Close()
-		return nil, nil, fmt.Errorf("could not initialize jetstream: %w", err)
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 
 	t := &MessageQueue{
 		ctx:               ctx,
 		cancel:            cancel,
 		nc:                nc,
-		js:                js,
 		l:                 l,
 		qos:               opts.qos,
 		subjectPrefix:     orDefault(opts.subjectPrefix, defaultQueueSubjectPrefix),
@@ -281,8 +313,35 @@ func New(fs ...MessageQueueOpt) (func() error, *MessageQueue, error) {
 		},
 		enableMessageRejection: opts.enableMessageRejection,
 		maxDeathCount:          opts.maxDeathCount,
+		asyncPublish:           opts.asyncPublish,
 		configFs:               fs,
 	}
+
+	jsOpts := []jetstream.JetStreamOpt{}
+
+	if opts.asyncPublish {
+		jsOpts = append(jsOpts,
+			jetstream.WithPublishAsyncMaxPending(defaultAsyncPublishMaxPending),
+			// In async mode SendMessage has already returned nil by the time a
+			// rejection arrives, so this handler is the only place the loss can
+			// be reported. Counting it also degrades IsReady, which is what
+			// stops a silently-failing publisher from looking healthy.
+			jetstream.WithPublishAsyncErrHandler(func(_ jetstream.JetStream, m *natsgo.Msg, err error) {
+				t.asyncPublishFailures.Add(1)
+				l.Error().Err(err).Str("subject", m.Subject).Msg("async publish was rejected by the server")
+			}),
+		)
+	}
+
+	js, err := jetstream.New(nc, jsOpts...)
+
+	if err != nil {
+		cancel()
+		nc.Close()
+		return nil, nil, fmt.Errorf("could not initialize jetstream: %w", err)
+	}
+
+	t.js = js
 
 	cleanup := func() error {
 		cancel()
@@ -317,8 +376,14 @@ func (t *MessageQueue) SetQOS(prefetchCount int) {
 	t.qos = prefetchCount
 }
 
+// IsReady reports whether the queue can currently carry messages.
+//
+// In async publish mode a server-side rejection arrives after SendMessage has
+// already returned nil, so a dropped message would otherwise leave no trace in
+// the caller's error path. Counting those failures here means a publisher that
+// is quietly losing messages stops reporting itself as healthy.
 func (t *MessageQueue) IsReady() bool {
-	return t.nc.IsConnected()
+	return t.nc.IsConnected() && t.asyncPublishFailures.Load() == 0
 }
 
 // subject returns the NATS subject a queue's messages are published to.
@@ -521,6 +586,20 @@ func (t *MessageQueue) pubMessage(ctx context.Context, q msgqueue.Queue, msg *ms
 	}
 
 	pubSpan.SetAttributes(spanAttrs...)
+
+	if t.asyncPublish {
+		// PublishAsync returns as soon as the client accepts the message,
+		// blocking only once defaultAsyncPublishMaxPending publishes are
+		// outstanding. Rejections surface through the async error handler
+		// installed in New rather than here.
+		if _, err := t.js.PublishAsync(subject, body); err != nil {
+			pubSpan.RecordError(err)
+			pubSpan.SetStatus(codes.Error, "error publishing message")
+			return fmt.Errorf("could not publish to %s: %w", subject, err)
+		}
+
+		return nil
+	}
 
 	// Unlike the rabbitmq backend, which publishes without confirms, JetStream
 	// acks every publish. A nil error here means the message is persisted and
