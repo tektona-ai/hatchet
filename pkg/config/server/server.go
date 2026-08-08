@@ -516,11 +516,13 @@ type ConfigFileAuthCookie struct {
 type MessageQueueConfigFile struct {
 	Enabled bool `mapstructure:"enabled" json:"enabled,omitempty" default:"true"`
 
-	Kind string `mapstructure:"kind" json:"kind,omitempty" validate:"required,oneof=rabbitmq postgres" default:"rabbitmq"`
+	Kind string `mapstructure:"kind" json:"kind,omitempty" validate:"required,oneof=rabbitmq postgres nats" default:"rabbitmq"`
 
 	Postgres PostgresMQConfigFile `mapstructure:"postgres" json:"postgres,omitempty"`
 
 	RabbitMQ RabbitMQConfigFile `mapstructure:"rabbitmq" json:"rabbitmq,omitempty" validate:"required"`
+
+	NATS NATSConfigFile `mapstructure:"nats" json:"nats,omitempty"`
 
 	PubSub PubSubConfigFile `mapstructure:"pubSub" json:"pubSub,omitempty"`
 }
@@ -570,6 +572,41 @@ type PubSubNATSConfigFile struct {
 	// SubjectPrefix is prepended (with a trailing ".") to topic names.
 	// Empty defaults to "hatchet.pubsub".
 	SubjectPrefix string `mapstructure:"subjectPrefix" json:"subjectPrefix,omitempty"`
+}
+
+// NATSConfigFile configures the durable message queue when msgQueue.kind is
+// "nats". The durable queue requires JetStream to be enabled on the server;
+// the pub/sub (see PubSubNATSConfigFile) uses core NATS and does not.
+type NATSConfigFile struct {
+	// URL is comma-separated seed URL(s). Prefer bare hosts (e.g.
+	// nats://nats:4222) and put auth in Username/Password so rediscovered
+	// cluster peers authenticate too. Use tls:// for TLS.
+	URL string `mapstructure:"url" json:"url,omitempty"`
+
+	Username string `mapstructure:"username" json:"username,omitempty"`
+	Password string `mapstructure:"password" json:"password,omitempty"`
+
+	// SubjectPrefix is prepended (with a trailing ".") to queue subjects.
+	// Empty defaults to "hatchet.mq".
+	SubjectPrefix string `mapstructure:"subjectPrefix" json:"subjectPrefix,omitempty"`
+
+	// StreamPrefix prefixes every JetStream stream this engine creates. Stream
+	// names are a flat namespace per NATS account, so two Hatchet installations
+	// sharing an account must set different prefixes — the subject prefix alone
+	// does not keep them apart. Empty defaults to "HATCHET".
+	StreamPrefix string `mapstructure:"streamPrefix" json:"streamPrefix,omitempty"`
+
+	// Qos becomes the consumer's MaxAckPending, the JetStream analogue of an
+	// AMQP prefetch count.
+	Qos int `mapstructure:"qos" json:"qos,omitempty" default:"100"`
+
+	CompressionEnabled   bool `mapstructure:"compressionEnabled" json:"compressionEnabled,omitempty" default:"false"`
+	CompressionThreshold int  `mapstructure:"compressionThreshold" json:"compressionThreshold,omitempty" default:"5120"`
+
+	// EnableMessageRejection caps redelivery attempts at MaxDeathCount instead
+	// of retrying a failing message forever.
+	EnableMessageRejection bool `mapstructure:"enableMessageRejection" json:"enableMessageRejection,omitempty" default:"false"`
+	MaxDeathCount          int  `mapstructure:"maxDeathCount" json:"maxDeathCount,omitempty" default:"1000"`
 }
 
 type PostgresMQConfigFile struct {
@@ -913,6 +950,17 @@ func BindAllEnv(v *viper.Viper) {
 	_ = v.BindEnv("msgQueue.rabbitmq.qos", "SERVER_MSGQUEUE_RABBITMQ_QOS")
 
 	// pub/sub (all optional: inherit from the durable msgQueue settings when unset)
+	_ = v.BindEnv("msgQueue.nats.url", "SERVER_MSGQUEUE_NATS_URL")
+	_ = v.BindEnv("msgQueue.nats.username", "SERVER_MSGQUEUE_NATS_USERNAME")
+	_ = v.BindEnv("msgQueue.nats.password", "SERVER_MSGQUEUE_NATS_PASSWORD")
+	_ = v.BindEnv("msgQueue.nats.subjectPrefix", "SERVER_MSGQUEUE_NATS_SUBJECT_PREFIX")
+	_ = v.BindEnv("msgQueue.nats.streamPrefix", "SERVER_MSGQUEUE_NATS_STREAM_PREFIX")
+	_ = v.BindEnv("msgQueue.nats.qos", "SERVER_MSGQUEUE_NATS_QOS")
+	_ = v.BindEnv("msgQueue.nats.compressionEnabled", "SERVER_MSGQUEUE_NATS_COMPRESSION_ENABLED")
+	_ = v.BindEnv("msgQueue.nats.compressionThreshold", "SERVER_MSGQUEUE_NATS_COMPRESSION_THRESHOLD")
+	_ = v.BindEnv("msgQueue.nats.enableMessageRejection", "SERVER_MSGQUEUE_NATS_ENABLE_MESSAGE_REJECTION")
+	_ = v.BindEnv("msgQueue.nats.maxDeathCount", "SERVER_MSGQUEUE_NATS_MAX_DEATH_COUNT")
+
 	_ = v.BindEnv("msgQueue.pubSub.kind", "SERVER_MSGQUEUE_PUBSUB_KIND")
 	_ = v.BindEnv("msgQueue.pubSub.rabbitmq.url", "SERVER_MSGQUEUE_PUBSUB_RABBITMQ_URL")
 	_ = v.BindEnv("msgQueue.pubSub.rabbitmq.maxPubChans", "SERVER_MSGQUEUE_PUBSUB_RABBITMQ_MAX_PUB_CHANS")

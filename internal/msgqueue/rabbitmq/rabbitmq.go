@@ -4,16 +4,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"slices"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/jackc/pgerrcode"
-	"github.com/jackc/pgx/v5/pgconn"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/rs/zerolog"
 	"go.opentelemetry.io/otel/attribute"
@@ -808,28 +804,7 @@ func (t *MessageQueueImpl) subscribe(
 }
 
 func isPermanentPreAckError(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) {
-		// invalid input syntax for type json / jsonb
-		if pgErr.Code == pgerrcode.InvalidTextRepresentation {
-			return true
-		}
-	}
-
-	// Fallback: some error paths may lose pg error type info.
-	errStr := err.Error()
-	if strings.Contains(errStr, fmt.Sprintf("SQLSTATE %s", pgerrcode.InvalidTextRepresentation)) {
-		return true
-	}
-	if strings.Contains(errStr, "invalid input syntax for type json") {
-		return true
-	}
-
-	return false
+	return msgqueue.IsPermanentPreAckError(err)
 }
 
 // identity returns the same host/process unique string for the lifetime of

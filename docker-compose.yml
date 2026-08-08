@@ -55,8 +55,11 @@ services:
       - "4222:4222"
     volumes:
       - "./hack/dev/nats-server.conf:/etc/nats/nats-server.conf:ro"
+      # JetStream store_dir, used only by the durable message queue backend.
+      - "hatchet_nats_data:/data"
 
 volumes:
   hatchet_postgres_data:
+  hatchet_nats_data:
   hatchet_rabbitmq_data:
   hatchet_rabbitmq.conf:
