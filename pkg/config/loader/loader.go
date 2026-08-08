@@ -554,6 +554,7 @@ func createControllerLayer(dc *database.Layer, cf *server.ServerConfigFile, vers
 					cf.MessageQueue.NATS.CompressionThreshold,
 				),
 				natsmq.WithMessageRejection(cf.MessageQueue.NATS.EnableMessageRejection, cf.MessageQueue.NATS.MaxDeathCount),
+				natsmq.WithAsyncPublish(cf.MessageQueue.NATS.AsyncPublish),
 			)
 
 			if err != nil {

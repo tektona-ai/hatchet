@@ -312,6 +312,7 @@ Variables marked with ⚠️ are conditionally required when specific features a
 | `SERVER_MSGQUEUE_NATS_COMPRESSION_THRESHOLD`        | Byte size above which messages are compressed                                                              | `5120`           |
 | `SERVER_MSGQUEUE_NATS_ENABLE_MESSAGE_REJECTION`     | Stop redelivering messages past the max death count                                                        | `false`          |
 | `SERVER_MSGQUEUE_NATS_MAX_DEATH_COUNT`              | Max redeliveries before a message is rejected                                                              | `1000`           |
+| `SERVER_MSGQUEUE_NATS_ASYNC_PUBLISH`                | Pipeline publishes instead of awaiting a server ack per message (see below)                                | `false`          |
 | `SERVER_MSGQUEUE_PUBSUB_KIND`                       | Pub/sub kind: `rabbitmq`, `postgres`, or `nats` (inherits `SERVER_MSGQUEUE_KIND` when unset)               |                  |
 | `SERVER_MSGQUEUE_PUBSUB_RABBITMQ_URL`               | Pub/sub RabbitMQ URL (inherits `SERVER_MSGQUEUE_RABBITMQ_URL` when unset; always uses its own connections) |                  |
 | `SERVER_MSGQUEUE_PUBSUB_RABBITMQ_MAX_PUB_CHANS`     | Pub/sub RabbitMQ max publish channels                                                                      | `10`             |
@@ -375,6 +376,37 @@ Streams are a separate, flat namespace per NATS account, and the subject prefix
 does not keep them apart. Two installations sharing an account must also set
 different `SERVER_MSGQUEUE_NATS_STREAM_PREFIX` values, or they will collide on
 stream names.
+
+#### Publish throughput
+
+By default every publish waits for JetStream to acknowledge it, so a successful
+send means the message is persisted. That costs one network round trip per
+message — measured at ~250µs against a loopback server, and proportionally more
+against a real network — and the engine publishes from several serial loops
+(task assignment, event ingest) that were written against RabbitMQ, where a
+publish is an unconfirmed socket write.
+
+Setting `SERVER_MSGQUEUE_NATS_ASYNC_PUBLISH=true` pipelines those publishes
+instead, which measured ~19x on the publish path (3.6k to 70k messages/second
+for a single serial publisher on loopback). Publishes remain bounded so a broker
+that stops acknowledging applies backpressure rather than growing the engine's
+memory without limit.
+
+The trade is what a successful send means: with async publishing it means the
+client has accepted the message, not that the server has stored it. A rejection
+that arrives afterwards is logged and marks the queue unhealthy, but the code
+that published has already moved on. This is the same guarantee the RabbitMQ
+backend gives — it publishes without confirms — so the engine is built for it.
+It is nonetheless weaker than this backend's default, which is why it is opt-in.
+
+Enable it if you are publish-bound, particularly when NATS is a network hop away
+rather than a sidecar. Note that publish throughput is not always what limits
+end-to-end task throughput; measure before enabling.
+
+Batch publishing (NATS 2.12+ atomic batches, 2.14+ fast ingest) is deliberately
+not used. Published figures put async publishing at or above atomic batching,
+and Hatchet sends one message per call, so there is no batch to form without
+duplicating the buffering the engine already does above this layer.
 
 #### Behavioral differences from RabbitMQ
 

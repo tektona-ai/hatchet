@@ -607,6 +607,14 @@ type NATSConfigFile struct {
 	// of retrying a failing message forever.
 	EnableMessageRejection bool `mapstructure:"enableMessageRejection" json:"enableMessageRejection,omitempty" default:"false"`
 	MaxDeathCount          int  `mapstructure:"maxDeathCount" json:"maxDeathCount,omitempty" default:"1000"`
+
+	// AsyncPublish pipelines publishes rather than waiting for a server ack on
+	// each one. It makes a nil error from a send mean "accepted by the client"
+	// rather than "persisted by the server" — the same guarantee the RabbitMQ
+	// backend gives, since it publishes without confirms — in exchange for
+	// roughly 20x on the publish path. Rejections are logged and mark the queue
+	// unhealthy.
+	AsyncPublish bool `mapstructure:"asyncPublish" json:"asyncPublish,omitempty" default:"false"`
 }
 
 type PostgresMQConfigFile struct {
@@ -960,6 +968,7 @@ func BindAllEnv(v *viper.Viper) {
 	_ = v.BindEnv("msgQueue.nats.compressionThreshold", "SERVER_MSGQUEUE_NATS_COMPRESSION_THRESHOLD")
 	_ = v.BindEnv("msgQueue.nats.enableMessageRejection", "SERVER_MSGQUEUE_NATS_ENABLE_MESSAGE_REJECTION")
 	_ = v.BindEnv("msgQueue.nats.maxDeathCount", "SERVER_MSGQUEUE_NATS_MAX_DEATH_COUNT")
+	_ = v.BindEnv("msgQueue.nats.asyncPublish", "SERVER_MSGQUEUE_NATS_ASYNC_PUBLISH")
 
 	_ = v.BindEnv("msgQueue.pubSub.kind", "SERVER_MSGQUEUE_PUBSUB_KIND")
 	_ = v.BindEnv("msgQueue.pubSub.rabbitmq.url", "SERVER_MSGQUEUE_PUBSUB_RABBITMQ_URL")
