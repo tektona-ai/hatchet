@@ -3,11 +3,16 @@ name: Release to GHCR
 # Publishes this fork's server images to GHCR under the repository owner's
 # namespace.
 #
+# Tags follow upstream exactly: a fork tag of v0.101.11 is upstream v0.101.11
+# plus this fork's changes. That makes the base obvious and a version bump a
+# straight swap. Nothing collides, because upstream publishes to
+# ghcr.io/hatchet-dev/ and this to ghcr.io/<owner>/hatchet/.
+#
 # This exists alongside upstream's pre-release.yaml/release.yaml rather than
 # replacing them: those push to ghcr.io/hatchet-dev/... and schedule arm64 jobs
-# on a self-hosted `hatchet-arm64-2` runner, neither of which a fork has. They
-# should be disabled in the Actions UI so a tag push does not start builds that
-# cannot succeed.
+# on a self-hosted `hatchet-arm64-2` runner, neither of which a fork has. Both
+# had their automatic triggers removed, so a tag push starts only this
+# workflow.
 
 on:
   push:
@@ -16,15 +21,17 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Git tag to build, e.g. v0.94.16-nats.1"
+        description: "Git tag to build, e.g. v0.101.11"
         required: true
 
 permissions:
   contents: read
   packages: write
 
-# A tag is built once. A second run for the same tag would race the first to
-# publish the same image reference.
+# One run per tag at a time. Two runs for the same tag would race to publish the
+# same image reference. Re-running a tag is allowed and queues behind the first
+# — it is how a fork-only fix ships against an unchanged upstream version, since
+# the tag has to move rather than gain a suffix.
 concurrency:
   group: ghcr-release-${{ github.event.inputs.tag || github.ref_name }}
   cancel-in-progress: false
@@ -57,9 +64,10 @@ jobs:
             exit 1
           fi
 
-          # Only an exact vX.Y.Z moves the :latest pointer. Pre-release tags
-          # (v1.2.3-nats.1) publish under their own name and nothing else, so
-          # cutting one never changes what an untagged pull resolves to.
+          # Only an exact vX.Y.Z moves the :latest pointer, which every tag that
+          # matches an upstream release does. Anything else — an rc, an alpha, a
+          # one-off build tag — publishes under its own name and leaves :latest
+          # pointing where it was.
           if echo "$tag" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
             is_stable=true
           else
