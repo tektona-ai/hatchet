@@ -455,6 +455,34 @@ synchronous publishing costs one round trip per message and therefore degrades
 in direct proportion to the round-trip time, while pipelined publishing does
 not.
 
+#### How async publishing compares with RabbitMQ
+
+The comparison runs both ways, and it is worth being precise because "we might
+lose a message" sounds worse than it is.
+
+RabbitMQ publishes **without confirms**. A publish there returns once the frames
+are written to the socket, and nothing ever confirms that the broker accepted,
+routed or persisted them — a dropped message is reported nowhere. Async NATS
+still receives a JetStream acknowledgement for every publish; a rejection
+reaches the error handler, is logged, and marks the queue unhealthy so it stops
+reporting itself as ready. On that dimension async NATS is the stronger of the
+two.
+
+What is weaker is narrower. The NATS client appends to a 32 KiB write buffer and
+wakes a flusher goroutine, where the AMQP client flushes to the socket inline,
+so a hard kill (`SIGKILL`, OOM) can lose what has not flushed yet — a window of
+microseconds. A graceful shutdown does not: the client flushes its outbound
+buffer before closing.
+
+Neither is as strong as the synchronous default, which returns only once
+JetStream has persisted and replicated the message.
+
+The reason any of this is tolerable is that **the scheduler's queue lives in
+Postgres**, not in the broker. Task messages wake a loop that also polls on its
+own, so a lost message delays work rather than losing it. That is why the
+synchronous default is the right one for correctness, and why async is a
+reasonable trade when publishing is genuinely the constraint.
+
 Batch publishing (NATS 2.12+ atomic batches, 2.14+ fast ingest) is deliberately
 not used. Published figures put async publishing at or above atomic batching, so
 the batching itself buys nothing here; the large numbers quoted for fast ingest

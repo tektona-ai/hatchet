@@ -664,11 +664,11 @@ type NATSConfigFile struct {
 	TLS NATSTLSConfigFile `mapstructure:"tls" json:"tls,omitempty"`
 
 	// AsyncPublish pipelines publishes rather than waiting for a server ack on
-	// each one. It makes a nil error from a send mean "accepted by the client"
-	// rather than "persisted by the server" — the same guarantee the RabbitMQ
-	// backend gives, since it publishes without confirms — in exchange for
-	// roughly 20x on the publish path. Rejections are logged and mark the queue
-	// unhealthy.
+	// each one, in exchange for roughly 20x on the publish path. It makes a nil
+	// error from a send mean "accepted by the client" rather than "persisted by
+	// the server"; rejections are logged asynchronously and mark the queue
+	// unhealthy. See the docs for how that compares with RabbitMQ, which
+	// publishes without confirms and so never reports a rejection at all.
 	AsyncPublish bool `mapstructure:"asyncPublish" json:"asyncPublish,omitempty" default:"false"`
 }
 

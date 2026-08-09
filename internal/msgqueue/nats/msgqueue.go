@@ -252,11 +252,21 @@ func WithExpirableMessageTTL(ttl time.Duration) MessageQueueOpt {
 //
 // The trade is the meaning of a nil error from SendMessage: it becomes "handed
 // to the client, which will deliver it" rather than "the server has persisted
-// it". A server-side rejection after the fact is reported through the async
-// error handler and makes IsReady false, but the SendMessage caller has already
-// moved on. This is the same guarantee the rabbitmq backend gives today (it
-// publishes without confirms), which is why it is safe for the engine — but it
-// is weaker than this backend's synchronous default, so it is opt-in.
+// it".
+//
+// Against the rabbitmq backend the comparison runs both ways. Rabbit publishes
+// with confirms off, so every publish there is unconfirmed forever and a broker
+// that drops a message reports nothing at all; here a rejection still reaches
+// the async error handler, gets logged, and makes IsReady false. What is worse
+// is narrower: nats.go appends to a 32KiB write buffer and kicks a flusher
+// goroutine, where amqp091 flushes to the socket inline, so a hard kill can
+// lose what has not flushed yet. A graceful shutdown does not -- Close flushes
+// the outbound buffer before closing the connection.
+//
+// What makes either acceptable is that the scheduler's queue lives in Postgres:
+// these messages wake a loop that also polls, so a lost one delays work rather
+// than losing it. It is still weaker than this backend's synchronous default,
+// so it stays opt-in.
 func WithAsyncPublish(enabled bool) MessageQueueOpt {
 	return func(opts *MessageQueueOpts) {
 		opts.asyncPublish = enabled
