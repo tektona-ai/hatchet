@@ -4,6 +4,7 @@ package loader
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log"
 	"net"
@@ -539,14 +540,18 @@ func createControllerLayer(dc *database.Layer, cf *server.ServerConfigFile, vers
 				return nil, nil, fmt.Errorf("using NATS as message queue requires a URL to be set")
 			}
 
+			natsMQTLS, err := natsTLSConfig(&cf.MessageQueue.NATS.TLS)
+
+			if err != nil {
+				return nil, nil, err
+			}
+
 			var cleanupv1 func() error
 
 			cleanupv1, mqv1, err = natsmq.New(
 				natsmq.WithURL(cf.MessageQueue.NATS.URL),
 				natsmq.WithUsername(cf.MessageQueue.NATS.Username),
 				natsmq.WithPassword(cf.MessageQueue.NATS.Password),
-				natsmq.WithSubjectPrefix(cf.MessageQueue.NATS.SubjectPrefix),
-				natsmq.WithStreamPrefix(cf.MessageQueue.NATS.StreamPrefix),
 				natsmq.WithLogger(&l),
 				natsmq.WithQos(cf.MessageQueue.NATS.Qos),
 				natsmq.WithGzipCompression(
@@ -555,6 +560,10 @@ func createControllerLayer(dc *database.Layer, cf *server.ServerConfigFile, vers
 				),
 				natsmq.WithMessageRejection(cf.MessageQueue.NATS.EnableMessageRejection, cf.MessageQueue.NATS.MaxDeathCount),
 				natsmq.WithAsyncPublish(cf.MessageQueue.NATS.AsyncPublish),
+				natsmq.WithToken(cf.MessageQueue.NATS.Token),
+				natsmq.WithCredentialsFile(cf.MessageQueue.NATS.CredentialsFile),
+				natsmq.WithNKeySeedFile(cf.MessageQueue.NATS.NKeySeedFile),
+				natsmq.WithTLSConfig(natsMQTLS),
 			)
 
 			if err != nil {
@@ -1100,17 +1109,26 @@ func createPubSubV1(dc *database.Layer, cf *server.ServerConfigFile, l *zerolog.
 		ps = rmqps
 		cleanup = cleanupRmq
 	case "nats":
-		natsURL, natsUsername, natsPassword := resolvePubSubNATSConn(cf)
+		conn := resolvePubSubNATSConn(cf)
 
-		if natsURL == "" {
+		if conn.url == "" {
 			return nil, nil, fmt.Errorf("using NATS as pubsub requires a URL to be set")
 		}
 
+		natsPSTLS, err := natsTLSConfig(&conn.tls)
+
+		if err != nil {
+			return nil, nil, err
+		}
+
 		cleanupNats, natsps, err := natsmq.NewPubSub(
-			natsmq.WithPubSubURL(natsURL),
-			natsmq.WithPubSubUsername(natsUsername),
-			natsmq.WithPubSubPassword(natsPassword),
-			natsmq.WithPubSubSubjectPrefix(cf.MessageQueue.PubSub.NATS.SubjectPrefix),
+			natsmq.WithPubSubURL(conn.url),
+			natsmq.WithPubSubUsername(conn.username),
+			natsmq.WithPubSubPassword(conn.password),
+			natsmq.WithPubSubToken(conn.token),
+			natsmq.WithPubSubCredentialsFile(conn.credentialsFile),
+			natsmq.WithPubSubNKeySeedFile(conn.nkeySeedFile),
+			natsmq.WithPubSubTLSConfig(natsPSTLS),
 			natsmq.WithPubSubLogger(l),
 		)
 
@@ -1155,16 +1173,96 @@ func resolvePubSubKindAndURL(cf *server.ServerConfigFile) (kind string, rabbitUR
 // The URL, username and password are inherited as a unit: taking the URL from
 // one config and credentials from the other would assemble a pair that was
 // never written down anywhere.
-func resolvePubSubNATSConn(cf *server.ServerConfigFile) (url, username, password string) {
-	url = cf.MessageQueue.PubSub.NATS.URL
-	username = cf.MessageQueue.PubSub.NATS.Username
-	password = cf.MessageQueue.PubSub.NATS.Password
+// natsTLSConfig turns a NATS TLS block into a client tls.Config, or nil when
+// transport security is off.
+//
+// The certificate and CA parsing is delegated to loaderutils so NATS gets the
+// same handling — inline or file, TLS 1.3 default — as every other TLS
+// consumer in the engine.
+func natsTLSConfig(cf *server.NATSTLSConfigFile) (*tls.Config, error) {
+	strategy := strings.ToLower(strings.TrimSpace(cf.Strategy))
 
-	if url == "" && strings.EqualFold(cf.MessageQueue.Kind, "nats") {
-		return cf.MessageQueue.NATS.URL, cf.MessageQueue.NATS.Username, cf.MessageQueue.NATS.Password
+	if strategy == "" || strategy == "none" {
+		return nil, nil
 	}
 
-	return url, username, password
+	base, ca, err := loaderutils.LoadBaseTLSConfig(&shared.TLSConfigFile{
+		TLSCert:       cf.Cert,
+		TLSCertFile:   cf.CertFile,
+		TLSKey:        cf.Key,
+		TLSKeyFile:    cf.KeyFile,
+		TLSRootCA:     cf.RootCA,
+		TLSRootCAFile: cf.RootCAFile,
+		TLSMinVersion: cf.MinVersion,
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("could not load nats TLS config: %w", err)
+	}
+
+	// Nil leaves RootCAs unset, which means the system trust store -- correct
+	// for a publicly-signed certificate, and the reason a private CA has to be
+	// configured explicitly.
+	if ca != nil {
+		base.RootCAs = ca
+	}
+
+	if cf.ServerName != "" {
+		base.ServerName = cf.ServerName
+	}
+
+	if strategy == "mtls" && len(base.Certificates) == 0 {
+		return nil, fmt.Errorf("nats TLS strategy is \"mtls\" but no client certificate and key were configured")
+	}
+
+	return base, nil
+}
+
+// natsConnSettings is everything needed to open a NATS connection: where to
+// reach it, how to authenticate, and how to secure the transport.
+type natsConnSettings struct {
+	url             string
+	username        string
+	password        string
+	token           string
+	credentialsFile string
+	nkeySeedFile    string
+	tls             server.NATSTLSConfigFile
+}
+
+// resolvePubSubNATSConn resolves the pub/sub's NATS connection settings,
+// inheriting the durable queue's when the pub/sub has none of its own, so
+// `msgQueue.kind: nats` needs no second copy of the credentials.
+//
+// Inheritance is all-or-nothing. Taking the URL from one block and credentials
+// or a CA from the other would assemble a connection nobody configured, and for
+// TLS that could mean verifying a private CA against the wrong server.
+func resolvePubSubNATSConn(cf *server.ServerConfigFile) natsConnSettings {
+	ps := cf.MessageQueue.PubSub.NATS
+
+	if ps.URL == "" && strings.EqualFold(cf.MessageQueue.Kind, "nats") {
+		mq := cf.MessageQueue.NATS
+
+		return natsConnSettings{
+			url:             mq.URL,
+			username:        mq.Username,
+			password:        mq.Password,
+			token:           mq.Token,
+			credentialsFile: mq.CredentialsFile,
+			nkeySeedFile:    mq.NKeySeedFile,
+			tls:             mq.TLS,
+		}
+	}
+
+	return natsConnSettings{
+		url:             ps.URL,
+		username:        ps.Username,
+		password:        ps.Password,
+		token:           ps.Token,
+		credentialsFile: ps.CredentialsFile,
+		nkeySeedFile:    ps.NKeySeedFile,
+		tls:             ps.TLS,
+	}
 }
 
 func getStrArr(v string) []string {

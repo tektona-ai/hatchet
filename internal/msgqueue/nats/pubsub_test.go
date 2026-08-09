@@ -263,7 +263,7 @@ func TestPubSubCustomSubjectPrefix(t *testing.T) {
 	defer cancel()
 
 	prefix := "custom.prefix"
-	ps := newTestPubSub(t, WithPubSubSubjectPrefix(prefix))
+	ps := newTestPubSub(t, withPubSubSubjectPrefix(prefix))
 
 	tenantId := uuid.New()
 	topic := msgqueue.TenantTopic(tenantId)

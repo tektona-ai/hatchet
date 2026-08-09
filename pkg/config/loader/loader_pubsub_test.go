@@ -14,16 +14,15 @@ import (
 // fully configured pub/sub path with zero new variables.
 func TestPubSubSettingsInheritance(t *testing.T) {
 	cases := []struct {
-		name                  string
-		env                   map[string]string
-		wantKind              string
-		wantURL               string
-		wantNatsURL           string
-		wantNatsUsername      string
-		wantNatsPassword      string
-		wantNatsSubjectPrefix string
-		wantMaxPub            int32
-		wantMaxSub            int32
+		name             string
+		env              map[string]string
+		wantKind         string
+		wantURL          string
+		wantNatsURL      string
+		wantNatsUsername string
+		wantNatsPassword string
+		wantMaxPub       int32
+		wantMaxSub       int32
 	}{
 		{
 			name: "modern rabbit env only",
@@ -117,22 +116,6 @@ func TestPubSubSettingsInheritance(t *testing.T) {
 			wantMaxSub:       20,
 		},
 		{
-			name: "nats pubsub with subject prefix",
-			env: map[string]string{
-				"SERVER_MSGQUEUE_KIND":                       "rabbitmq",
-				"SERVER_MSGQUEUE_RABBITMQ_URL":               "amqp://user:password@rabbit:5672/",
-				"SERVER_MSGQUEUE_PUBSUB_KIND":                "nats",
-				"SERVER_MSGQUEUE_PUBSUB_NATS_URL":            "nats://nats:4222",
-				"SERVER_MSGQUEUE_PUBSUB_NATS_SUBJECT_PREFIX": "my.prefix",
-			},
-			wantKind:              "nats",
-			wantURL:               "amqp://user:password@rabbit:5672/",
-			wantNatsURL:           "nats://nats:4222",
-			wantNatsSubjectPrefix: "my.prefix",
-			wantMaxPub:            10,
-			wantMaxSub:            20,
-		},
-		{
 			// A NATS-only deployment sets the durable kind and nothing else;
 			// the pub/sub must follow it rather than demanding its own block.
 			name: "nats durable only",
@@ -165,7 +148,6 @@ func TestPubSubSettingsInheritance(t *testing.T) {
 			assert.Equal(t, tc.wantNatsURL, cf.MessageQueue.PubSub.NATS.URL)
 			assert.Equal(t, tc.wantNatsUsername, cf.MessageQueue.PubSub.NATS.Username)
 			assert.Equal(t, tc.wantNatsPassword, cf.MessageQueue.PubSub.NATS.Password)
-			assert.Equal(t, tc.wantNatsSubjectPrefix, cf.MessageQueue.PubSub.NATS.SubjectPrefix)
 		})
 	}
 }
@@ -234,11 +216,11 @@ func TestPubSubNATSConnInheritance(t *testing.T) {
 			cf, err := LoadServerConfigFile()
 			require.NoError(t, err)
 
-			url, username, password := resolvePubSubNATSConn(cf)
+			conn := resolvePubSubNATSConn(cf)
 
-			assert.Equal(t, tc.wantURL, url)
-			assert.Equal(t, tc.wantUsername, username)
-			assert.Equal(t, tc.wantPassword, password)
+			assert.Equal(t, tc.wantURL, conn.url)
+			assert.Equal(t, tc.wantUsername, conn.username)
+			assert.Equal(t, tc.wantPassword, conn.password)
 		})
 	}
 }

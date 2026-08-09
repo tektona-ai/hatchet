@@ -569,9 +569,57 @@ type PubSubNATSConfigFile struct {
 	Username string `mapstructure:"username" json:"username,omitempty"`
 	Password string `mapstructure:"password" json:"password,omitempty"`
 
-	// SubjectPrefix is prepended (with a trailing ".") to topic names.
-	// Empty defaults to "hatchet.pubsub".
-	SubjectPrefix string `mapstructure:"subjectPrefix" json:"subjectPrefix,omitempty"`
+	// Token authenticates with a server configured for token auth.
+	Token string `mapstructure:"token" json:"token,omitempty"`
+
+	// CredentialsFile is a path to a NATS .creds file holding a user JWT and
+	// its seed — the mechanism operator-issued accounts and Synadia Cloud use.
+	CredentialsFile string `mapstructure:"credentialsFile" json:"credentialsFile,omitempty"`
+
+	// NKeySeedFile is a path to a file holding an NKey seed, for servers that
+	// authenticate NKeys without a JWT.
+	NKeySeedFile string `mapstructure:"nkeySeedFile" json:"nkeySeedFile,omitempty"`
+
+	// TLS configures transport security. Exactly one authentication mechanism
+	// may be set across Username/Password, Token, CredentialsFile and
+	// NKeySeedFile; configuring more is rejected at startup rather than
+	// resolved by precedence.
+	TLS NATSTLSConfigFile `mapstructure:"tls" json:"tls,omitempty"`
+}
+
+// NATSTLSConfigFile configures transport security for a NATS connection.
+//
+// It mirrors shared.TLSConfigFile rather than embedding it because that type
+// defaults its strategy to "tls". NATS connections are plaintext unless the
+// server says otherwise, so defaulting to TLS here would break every existing
+// deployment on upgrade. The strategy therefore defaults to "none" and turning
+// on transport security is an explicit act.
+type NATSTLSConfigFile struct {
+	// Strategy is "none" (default), "tls", or "mtls". Anything other than
+	// "none" makes TLS mandatory for the connection: it fails rather than
+	// falling back to plaintext.
+	Strategy string `mapstructure:"strategy" json:"strategy,omitempty" validate:"omitempty,oneof=none tls mtls" default:"none"`
+
+	// RootCA is the PEM-encoded CA bundle used to verify the server. Needed
+	// when the server presents a certificate from a private CA. RootCAFile is
+	// the same thing read from disk.
+	RootCA     string `mapstructure:"rootCA" json:"rootCA,omitempty"`
+	RootCAFile string `mapstructure:"rootCAFile" json:"rootCAFile,omitempty"`
+
+	// Cert and Key are the client certificate presented for mTLS, inline or
+	// from disk. Required when Strategy is "mtls".
+	Cert     string `mapstructure:"cert" json:"cert,omitempty"`
+	CertFile string `mapstructure:"certFile" json:"certFile,omitempty"`
+	Key      string `mapstructure:"key" json:"key,omitempty"`
+	KeyFile  string `mapstructure:"keyFile" json:"keyFile,omitempty"`
+
+	// ServerName overrides the name verified against the server certificate.
+	// Needed when connecting by IP, or through a name the certificate does not
+	// carry.
+	ServerName string `mapstructure:"serverName" json:"serverName,omitempty"`
+
+	// MinVersion is "1.2" or "1.3". Empty defaults to TLS 1.3.
+	MinVersion string `mapstructure:"minVersion" json:"minVersion,omitempty"`
 }
 
 // NATSConfigFile configures the durable message queue when msgQueue.kind is
@@ -586,16 +634,6 @@ type NATSConfigFile struct {
 	Username string `mapstructure:"username" json:"username,omitempty"`
 	Password string `mapstructure:"password" json:"password,omitempty"`
 
-	// SubjectPrefix is prepended (with a trailing ".") to queue subjects.
-	// Empty defaults to "hatchet.mq".
-	SubjectPrefix string `mapstructure:"subjectPrefix" json:"subjectPrefix,omitempty"`
-
-	// StreamPrefix prefixes every JetStream stream this engine creates. Stream
-	// names are a flat namespace per NATS account, so two Hatchet installations
-	// sharing an account must set different prefixes — the subject prefix alone
-	// does not keep them apart. Empty defaults to "HATCHET".
-	StreamPrefix string `mapstructure:"streamPrefix" json:"streamPrefix,omitempty"`
-
 	// Qos becomes the consumer's MaxAckPending, the JetStream analogue of an
 	// AMQP prefetch count.
 	Qos int `mapstructure:"qos" json:"qos,omitempty" default:"100"`
@@ -607,6 +645,23 @@ type NATSConfigFile struct {
 	// of retrying a failing message forever.
 	EnableMessageRejection bool `mapstructure:"enableMessageRejection" json:"enableMessageRejection,omitempty" default:"false"`
 	MaxDeathCount          int  `mapstructure:"maxDeathCount" json:"maxDeathCount,omitempty" default:"1000"`
+
+	// Token authenticates with a server configured for token auth.
+	Token string `mapstructure:"token" json:"token,omitempty"`
+
+	// CredentialsFile is a path to a NATS .creds file holding a user JWT and
+	// its seed — the mechanism operator-issued accounts and Synadia Cloud use.
+	CredentialsFile string `mapstructure:"credentialsFile" json:"credentialsFile,omitempty"`
+
+	// NKeySeedFile is a path to a file holding an NKey seed, for servers that
+	// authenticate NKeys without a JWT.
+	NKeySeedFile string `mapstructure:"nkeySeedFile" json:"nkeySeedFile,omitempty"`
+
+	// TLS configures transport security. Exactly one authentication mechanism
+	// may be set across Username/Password, Token, CredentialsFile and
+	// NKeySeedFile; configuring more is rejected at startup rather than
+	// resolved by precedence.
+	TLS NATSTLSConfigFile `mapstructure:"tls" json:"tls,omitempty"`
 
 	// AsyncPublish pipelines publishes rather than waiting for a server ack on
 	// each one. It makes a nil error from a send mean "accepted by the client"
@@ -961,14 +1016,37 @@ func BindAllEnv(v *viper.Viper) {
 	_ = v.BindEnv("msgQueue.nats.url", "SERVER_MSGQUEUE_NATS_URL")
 	_ = v.BindEnv("msgQueue.nats.username", "SERVER_MSGQUEUE_NATS_USERNAME")
 	_ = v.BindEnv("msgQueue.nats.password", "SERVER_MSGQUEUE_NATS_PASSWORD")
-	_ = v.BindEnv("msgQueue.nats.subjectPrefix", "SERVER_MSGQUEUE_NATS_SUBJECT_PREFIX")
-	_ = v.BindEnv("msgQueue.nats.streamPrefix", "SERVER_MSGQUEUE_NATS_STREAM_PREFIX")
 	_ = v.BindEnv("msgQueue.nats.qos", "SERVER_MSGQUEUE_NATS_QOS")
 	_ = v.BindEnv("msgQueue.nats.compressionEnabled", "SERVER_MSGQUEUE_NATS_COMPRESSION_ENABLED")
 	_ = v.BindEnv("msgQueue.nats.compressionThreshold", "SERVER_MSGQUEUE_NATS_COMPRESSION_THRESHOLD")
 	_ = v.BindEnv("msgQueue.nats.enableMessageRejection", "SERVER_MSGQUEUE_NATS_ENABLE_MESSAGE_REJECTION")
 	_ = v.BindEnv("msgQueue.nats.maxDeathCount", "SERVER_MSGQUEUE_NATS_MAX_DEATH_COUNT")
 	_ = v.BindEnv("msgQueue.nats.asyncPublish", "SERVER_MSGQUEUE_NATS_ASYNC_PUBLISH")
+
+	_ = v.BindEnv("msgQueue.nats.token", "SERVER_MSGQUEUE_NATS_TOKEN")
+	_ = v.BindEnv("msgQueue.nats.credentialsFile", "SERVER_MSGQUEUE_NATS_CREDENTIALS_FILE")
+	_ = v.BindEnv("msgQueue.nats.nkeySeedFile", "SERVER_MSGQUEUE_NATS_NKEY_SEED_FILE")
+	_ = v.BindEnv("msgQueue.nats.tls.strategy", "SERVER_MSGQUEUE_NATS_TLS_STRATEGY")
+	_ = v.BindEnv("msgQueue.nats.tls.rootCA", "SERVER_MSGQUEUE_NATS_TLS_ROOT_CA")
+	_ = v.BindEnv("msgQueue.nats.tls.rootCAFile", "SERVER_MSGQUEUE_NATS_TLS_ROOT_CA_FILE")
+	_ = v.BindEnv("msgQueue.nats.tls.cert", "SERVER_MSGQUEUE_NATS_TLS_CERT")
+	_ = v.BindEnv("msgQueue.nats.tls.certFile", "SERVER_MSGQUEUE_NATS_TLS_CERT_FILE")
+	_ = v.BindEnv("msgQueue.nats.tls.key", "SERVER_MSGQUEUE_NATS_TLS_KEY")
+	_ = v.BindEnv("msgQueue.nats.tls.keyFile", "SERVER_MSGQUEUE_NATS_TLS_KEY_FILE")
+	_ = v.BindEnv("msgQueue.nats.tls.serverName", "SERVER_MSGQUEUE_NATS_TLS_SERVER_NAME")
+	_ = v.BindEnv("msgQueue.nats.tls.minVersion", "SERVER_MSGQUEUE_NATS_TLS_MIN_VERSION")
+	_ = v.BindEnv("msgQueue.pubSub.nats.token", "SERVER_MSGQUEUE_PUBSUB_NATS_TOKEN")
+	_ = v.BindEnv("msgQueue.pubSub.nats.credentialsFile", "SERVER_MSGQUEUE_PUBSUB_NATS_CREDENTIALS_FILE")
+	_ = v.BindEnv("msgQueue.pubSub.nats.nkeySeedFile", "SERVER_MSGQUEUE_PUBSUB_NATS_NKEY_SEED_FILE")
+	_ = v.BindEnv("msgQueue.pubSub.nats.tls.strategy", "SERVER_MSGQUEUE_PUBSUB_NATS_TLS_STRATEGY")
+	_ = v.BindEnv("msgQueue.pubSub.nats.tls.rootCA", "SERVER_MSGQUEUE_PUBSUB_NATS_TLS_ROOT_CA")
+	_ = v.BindEnv("msgQueue.pubSub.nats.tls.rootCAFile", "SERVER_MSGQUEUE_PUBSUB_NATS_TLS_ROOT_CA_FILE")
+	_ = v.BindEnv("msgQueue.pubSub.nats.tls.cert", "SERVER_MSGQUEUE_PUBSUB_NATS_TLS_CERT")
+	_ = v.BindEnv("msgQueue.pubSub.nats.tls.certFile", "SERVER_MSGQUEUE_PUBSUB_NATS_TLS_CERT_FILE")
+	_ = v.BindEnv("msgQueue.pubSub.nats.tls.key", "SERVER_MSGQUEUE_PUBSUB_NATS_TLS_KEY")
+	_ = v.BindEnv("msgQueue.pubSub.nats.tls.keyFile", "SERVER_MSGQUEUE_PUBSUB_NATS_TLS_KEY_FILE")
+	_ = v.BindEnv("msgQueue.pubSub.nats.tls.serverName", "SERVER_MSGQUEUE_PUBSUB_NATS_TLS_SERVER_NAME")
+	_ = v.BindEnv("msgQueue.pubSub.nats.tls.minVersion", "SERVER_MSGQUEUE_PUBSUB_NATS_TLS_MIN_VERSION")
 
 	_ = v.BindEnv("msgQueue.pubSub.kind", "SERVER_MSGQUEUE_PUBSUB_KIND")
 	_ = v.BindEnv("msgQueue.pubSub.rabbitmq.url", "SERVER_MSGQUEUE_PUBSUB_RABBITMQ_URL")
@@ -979,7 +1057,6 @@ func BindAllEnv(v *viper.Viper) {
 	_ = v.BindEnv("msgQueue.pubSub.nats.url", "SERVER_MSGQUEUE_PUBSUB_NATS_URL")
 	_ = v.BindEnv("msgQueue.pubSub.nats.username", "SERVER_MSGQUEUE_PUBSUB_NATS_USERNAME")
 	_ = v.BindEnv("msgQueue.pubSub.nats.password", "SERVER_MSGQUEUE_PUBSUB_NATS_PASSWORD")
-	_ = v.BindEnv("msgQueue.pubSub.nats.subjectPrefix", "SERVER_MSGQUEUE_PUBSUB_NATS_SUBJECT_PREFIX")
 	_ = v.BindEnv("runtime.singleQueueLimit", "SERVER_SINGLE_QUEUE_LIMIT")
 	_ = v.BindEnv("runtime.optimisticSchedulingEnabled", "SERVER_OPTIMISTIC_SCHEDULING_ENABLED")
 	_ = v.BindEnv("runtime.optimisticSchedulingSlots", "SERVER_OPTIMISTIC_SCHEDULING_SLOTS")

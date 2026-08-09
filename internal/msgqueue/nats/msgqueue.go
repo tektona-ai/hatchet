@@ -2,6 +2,7 @@ package nats
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"slices"
@@ -114,6 +115,10 @@ type MessageQueueOpts struct {
 	url                    string
 	username               string
 	password               string
+	token                  string
+	credentialsFile        string
+	nkeySeedFile           string
+	tlsConfig              *tls.Config
 	qos                    int
 	subjectPrefix          string
 	streamPrefix           string
@@ -160,18 +165,48 @@ func WithPassword(password string) MessageQueueOpt {
 	}
 }
 
-// WithSubjectPrefix sets the subject namespace for durable queues (default
+// WithToken authenticates with a server configured for token auth.
+func WithToken(token string) MessageQueueOpt {
+	return func(opts *MessageQueueOpts) {
+		opts.token = token
+	}
+}
+
+// WithCredentialsFile authenticates with a NATS .creds file holding a user JWT
+// and its seed.
+func WithCredentialsFile(path string) MessageQueueOpt {
+	return func(opts *MessageQueueOpts) {
+		opts.credentialsFile = path
+	}
+}
+
+// WithNKeySeedFile authenticates with an NKey seed file.
+func WithNKeySeedFile(path string) MessageQueueOpt {
+	return func(opts *MessageQueueOpts) {
+		opts.nkeySeedFile = path
+	}
+}
+
+// WithTLSConfig makes the connection use TLS. A non-nil config makes TLS
+// mandatory: the connection fails rather than falling back to plaintext.
+func WithTLSConfig(cfg *tls.Config) MessageQueueOpt {
+	return func(opts *MessageQueueOpts) {
+		opts.tlsConfig = cfg
+	}
+}
+
+// withSubjectPrefix sets the subject namespace for durable queues (default
 // "hatchet.mq"). Empty falls back to the default.
-func WithSubjectPrefix(prefix string) MessageQueueOpt {
+func withSubjectPrefix(prefix string) MessageQueueOpt {
 	return func(opts *MessageQueueOpts) {
 		opts.subjectPrefix = prefix
 	}
 }
 
-// WithStreamPrefix sets the prefix for created stream names (default
+// withStreamPrefix sets the prefix for created stream names (default
 // "HATCHET"). Empty falls back to the default. Streams are global per NATS
 // account, so installations sharing an account must set distinct prefixes.
-func WithStreamPrefix(prefix string) MessageQueueOpt {
+func withStreamPrefix(prefix string) MessageQueueOpt {
 	return func(opts *MessageQueueOpts) {
 		opts.streamPrefix = prefix
 	}
@@ -279,7 +314,19 @@ func New(fs ...MessageQueueOpt) (func() error, *MessageQueue, error) {
 	newLogger := opts.l.With().Str("service", "nats-msgqueue").Logger()
 	l := &newLogger
 
-	nc, err := natsgo.Connect(opts.url, connectOptions(l, "nats msgqueue", opts.username, opts.password)...)
+	connOpts, err := connectOptions(l, "nats msgqueue", ConnAuth{
+		Username:        opts.username,
+		Password:        opts.password,
+		Token:           opts.token,
+		CredentialsFile: opts.credentialsFile,
+		NKeySeedFile:    opts.nkeySeedFile,
+	}, opts.tlsConfig)
+
+	if err != nil {
+		return nil, nil, err
+	}
+
+	nc, err := natsgo.Connect(opts.url, connOpts...)
 
 	if err != nil {
 		return nil, nil, fmt.Errorf("could not connect to nats at %q: %w", opts.url, err)
@@ -935,36 +982,6 @@ func hasStaticDLQ(q msgqueue.Queue) bool {
 	dlq := q.DLQ()
 
 	return dlq != nil && !dlq.IsAutoDLQ()
-}
-
-// connectOptions returns the nats.go options shared by the durable queue and
-// the pub/sub: retry forever, and log connection lifecycle transitions.
-func connectOptions(l *zerolog.Logger, name, username, password string) []natsgo.Option {
-	return []natsgo.Option{
-		// MaxReconnects(-1) retries forever: any finite limit permanently
-		// closes the connection once exhausted, leaving the engine without a
-		// message queue until a process restart.
-		natsgo.MaxReconnects(-1),
-		// Empty credentials never reach the wire (the CONNECT payload omits
-		// empty user/pass fields), so UserInfo is safe to set unconditionally.
-		natsgo.UserInfo(username, password),
-		natsgo.DisconnectErrHandler(func(_ *natsgo.Conn, err error) {
-			l.Warn().Err(err).Msgf("%s disconnected", name)
-		}),
-		natsgo.ReconnectHandler(func(nc *natsgo.Conn) {
-			l.Info().Str("url", nc.ConnectedUrl()).Msgf("%s reconnected", name)
-		}),
-		natsgo.ClosedHandler(func(_ *natsgo.Conn) {
-			l.Info().Msgf("%s connection closed", name)
-		}),
-		natsgo.ErrorHandler(func(_ *natsgo.Conn, sub *natsgo.Subscription, err error) {
-			subject := ""
-			if sub != nil {
-				subject = sub.Subject
-			}
-			l.Error().Err(err).Str("subject", subject).Msgf("%s async error", name)
-		}),
-	}
 }
 
 // sanitizeName maps a Hatchet queue name onto the character set NATS allows for

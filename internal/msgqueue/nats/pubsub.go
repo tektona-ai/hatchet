@@ -2,6 +2,7 @@ package nats
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"slices"
@@ -13,7 +14,7 @@ import (
 	"github.com/hatchet-dev/hatchet/pkg/logger"
 )
 
-// defaultSubjectPrefix is used when WithPubSubSubjectPrefix is unset or empty.
+// defaultSubjectPrefix is used when withPubSubSubjectPrefix is unset or empty.
 const defaultSubjectPrefix = "hatchet.pubsub"
 
 // PubSub implements msgqueue.PubSub over core NATS. Subjects are
@@ -28,11 +29,15 @@ type PubSub struct {
 type PubSubOpt func(*PubSubOpts)
 
 type PubSubOpts struct {
-	l             *zerolog.Logger
-	url           string
-	username      string
-	password      string
-	subjectPrefix string
+	l               *zerolog.Logger
+	url             string
+	username        string
+	password        string
+	token           string
+	credentialsFile string
+	nkeySeedFile    string
+	tlsConfig       *tls.Config
+	subjectPrefix   string
 }
 
 func defaultPubSubOpts() *PubSubOpts {
@@ -66,10 +71,40 @@ func WithPubSubPassword(password string) PubSubOpt {
 	}
 }
 
-// WithPubSubSubjectPrefix sets the NATS subject prefix (default
+// WithPubSubToken authenticates with a server configured for token auth.
+func WithPubSubToken(token string) PubSubOpt {
+	return func(opts *PubSubOpts) {
+		opts.token = token
+	}
+}
+
+// WithPubSubCredentialsFile authenticates with a NATS .creds file holding a
+// user JWT and its seed.
+func WithPubSubCredentialsFile(path string) PubSubOpt {
+	return func(opts *PubSubOpts) {
+		opts.credentialsFile = path
+	}
+}
+
+// WithPubSubNKeySeedFile authenticates with an NKey seed file.
+func WithPubSubNKeySeedFile(path string) PubSubOpt {
+	return func(opts *PubSubOpts) {
+		opts.nkeySeedFile = path
+	}
+}
+
+// WithPubSubTLSConfig makes the connection use TLS. A non-nil config makes TLS
+// mandatory: the connection fails rather than falling back to plaintext.
+func WithPubSubTLSConfig(cfg *tls.Config) PubSubOpt {
+	return func(opts *PubSubOpts) {
+		opts.tlsConfig = cfg
+	}
+}
+
+// withPubSubSubjectPrefix sets the NATS subject prefix (default
 // "hatchet.pubsub"). Empty falls back to the default. No trimming or
 // validation: a bad prefix fails loudly via nats ErrBadSubject at startup.
-func WithPubSubSubjectPrefix(prefix string) PubSubOpt {
+func withPubSubSubjectPrefix(prefix string) PubSubOpt {
 	return func(opts *PubSubOpts) {
 		opts.subjectPrefix = prefix
 	}
@@ -96,46 +131,22 @@ func NewPubSub(fs ...PubSubOpt) (func() error, *PubSub, error) {
 
 	l := opts.l
 
-	connectOpts := []natsgo.Option{
-		// Reconnect behavior is deliberately fixed rather than configurable.
-		// MaxReconnects(-1) retries forever: any finite limit permanently
-		// closes the connection once exhausted, leaving the engine without
-		// pub/sub until a process restart (the rabbitmq backend also retries
-		// indefinitely).
-		natsgo.MaxReconnects(-1),
-		// ReconnectBufSize(-1) disables the client-side buffer that would
-		// otherwise queue publishes during a disconnect and flush them on
-		// reconnect. These signals are latency optimizations over their
-		// consumers' polling paths (schedulers poll their queues, the
-		// dispatcher polls for unacked finished runs), so by the time a
-		// buffered publish flushed, polling would already have covered it;
-		// Pub fails fast while disconnected instead.
-		natsgo.ReconnectBufSize(-1),
-		// Empty credentials never reach the wire (the CONNECT payload omits
-		// empty user/pass fields), so UserInfo is safe to set unconditionally.
-		// Whether a username requires a password is the server's decision,
-		// enforced by the synchronous Connect below.
-		natsgo.UserInfo(opts.username, opts.password),
-		natsgo.DisconnectErrHandler(func(_ *natsgo.Conn, err error) {
-			if err != nil {
-				l.Warn().Err(err).Msg("nats pubsub disconnected")
-			} else {
-				l.Warn().Msg("nats pubsub disconnected")
-			}
-		}),
-		natsgo.ReconnectHandler(func(nc *natsgo.Conn) {
-			l.Info().Str("url", nc.ConnectedUrl()).Msg("nats pubsub reconnected")
-		}),
-		natsgo.ClosedHandler(func(_ *natsgo.Conn) {
-			l.Info().Msg("nats pubsub connection closed")
-		}),
-		natsgo.ErrorHandler(func(_ *natsgo.Conn, sub *natsgo.Subscription, err error) {
-			subject := ""
-			if sub != nil {
-				subject = sub.Subject
-			}
-			l.Error().Err(err).Str("subject", subject).Msg("nats pubsub async error")
-		}),
+	// ReconnectBufSize(-1) disables the client-side buffer that would otherwise
+	// queue publishes during a disconnect and flush them on reconnect. These
+	// signals are latency optimizations over their consumers' polling paths
+	// (schedulers poll their queues, the dispatcher polls for unacked finished
+	// runs), so by the time a buffered publish flushed, polling would already
+	// have covered it; Pub fails fast while disconnected instead.
+	connectOpts, err := connectOptions(l, "nats pubsub", ConnAuth{
+		Username:        opts.username,
+		Password:        opts.password,
+		Token:           opts.token,
+		CredentialsFile: opts.credentialsFile,
+		NKeySeedFile:    opts.nkeySeedFile,
+	}, opts.tlsConfig, natsgo.ReconnectBufSize(-1))
+
+	if err != nil {
+		return nil, nil, err
 	}
 
 	nc, err := natsgo.Connect(opts.url, connectOpts...)

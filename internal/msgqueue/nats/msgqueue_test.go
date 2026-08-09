@@ -32,8 +32,8 @@ func newTestMQ(t testing.TB, opts ...MessageQueueOpt) *MessageQueue {
 
 	base := []MessageQueueOpt{
 		WithURL(testNATSURL),
-		WithStreamPrefix("TEST_" + strings.ToUpper(ns)),
-		WithSubjectPrefix("test." + ns),
+		withStreamPrefix("TEST_" + strings.ToUpper(ns)),
+		withSubjectPrefix("test." + ns),
 	}
 
 	cleanup, mq, err := New(append(base, opts...)...)
