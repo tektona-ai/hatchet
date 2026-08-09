@@ -1,0 +1,294 @@
+name: Sync upstream release
+
+# Opens a pull request merging upstream's newest stable release into this fork.
+#
+# It deliberately does not merge anything itself. The fork carries real changes
+# to shared engine code, so an upstream release can conflict with them; the
+# point is to surface that for review promptly rather than to keep the fork
+# silently current.
+#
+# Requires "Allow GitHub Actions to create and approve pull requests" in the
+# repository's Actions settings. Without it, creating the pull request fails
+# with a permissions error even though the branch pushes fine.
+
+on:
+  schedule:
+    # Daily, early UTC. Upstream tags on no fixed schedule, so this is just
+    # "check often enough to notice within a day".
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream tag to sync, e.g. v0.101.11. Defaults to the newest stable."
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+# One sync at a time: two concurrent runs would race to create the same branch.
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/hatchet-dev/hatchet.git
+
+jobs:
+  sync:
+    name: sync
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Guard against this running anywhere it would be nonsense, e.g. if the
+    # workflow ever lands back upstream through a pull request.
+    if: github.repository != 'hatchet-dev/hatchet'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history: the merge needs the commits our main and upstream's
+          # tag have in common.
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream tags
+        run: |
+          set -euo pipefail
+
+          git remote add upstream "$UPSTREAM_URL" 2>/dev/null \
+            || git remote set-url upstream "$UPSTREAM_URL"
+
+          # Into their own ref namespace so upstream's tags never collide with
+          # this fork's own release tags.
+          git fetch --quiet upstream "refs/tags/*:refs/upstream-tags/*"
+
+      - name: Resolve target release
+        id: target
+        env:
+          REQUESTED: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "$REQUESTED" ]; then
+            tag="$REQUESTED"
+
+            if ! git rev-parse --verify --quiet "refs/upstream-tags/$tag" >/dev/null; then
+              echo "upstream has no tag $tag" >&2
+              exit 1
+            fi
+          else
+            # Stable releases only. Upstream also publishes -alpha.N tags, which
+            # are not what a fork should be tracking by default.
+            tag="$(
+              git for-each-ref --format='%(refname:strip=2)' refs/upstream-tags/ \
+                | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+                | sort -V \
+                | tail -1
+            )"
+          fi
+
+          if [ -z "$tag" ]; then
+            echo "could not determine an upstream stable tag" >&2
+            exit 1
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "branch=upstream-sync/$tag" >> "$GITHUB_OUTPUT"
+          echo "target release: $tag"
+
+      - name: Check whether it is already merged
+        id: state
+        env:
+          TAG: ${{ steps.target.outputs.tag }}
+          BRANCH: ${{ steps.target.outputs.branch }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Ask the history rather than tracking state in a file: if the tag's
+          # commit is already an ancestor of main, this release is in.
+          if git merge-base --is-ancestor "refs/upstream-tags/$TAG" HEAD; then
+            echo "skip=already-merged" >> "$GITHUB_OUTPUT"
+            echo "$TAG is already contained in main"
+            exit 0
+          fi
+
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "skip=branch-exists" >> "$GITHUB_OUTPUT"
+            echo "branch $BRANCH already exists; leaving it alone"
+            exit 0
+          fi
+
+          existing="$(gh pr list --state open --head "$BRANCH" --json number --jq 'length')"
+
+          if [ "$existing" != "0" ]; then
+            echo "skip=pr-exists" >> "$GITHUB_OUTPUT"
+            echo "an open pull request for $BRANCH already exists"
+            exit 0
+          fi
+
+          echo "skip=" >> "$GITHUB_OUTPUT"
+
+      - name: Attempt the merge
+        id: merge
+        if: steps.state.outputs.skip == ''
+        env:
+          TAG: ${{ steps.target.outputs.tag }}
+          BRANCH: ${{ steps.target.outputs.branch }}
+        run: |
+          set -euo pipefail
+
+          git checkout -b "$BRANCH"
+
+          if git merge --no-edit "refs/upstream-tags/$TAG"; then
+            echo "clean=true" >> "$GITHUB_OUTPUT"
+            echo "merged $TAG cleanly"
+            exit 0
+          fi
+
+          # Record what collided before unwinding, so the issue can name the
+          # files rather than just saying "there were conflicts".
+          conflicts="$(git diff --name-only --diff-filter=U || true)"
+
+          git merge --abort || true
+
+          echo "clean=false" >> "$GITHUB_OUTPUT"
+          {
+            echo "conflicts<<EOF"
+            echo "$conflicts"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "$TAG conflicts with this fork:"
+          echo "$conflicts"
+
+      - name: Open the pull request
+        if: steps.state.outputs.skip == '' && steps.merge.outputs.clean == 'true'
+        env:
+          TAG: ${{ steps.target.outputs.tag }}
+          BRANCH: ${{ steps.target.outputs.branch }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          git push origin "$BRANCH"
+
+          # Summarise what the fork is taking on, so the PR is reviewable
+          # without checking out the branch.
+          commits="$(git rev-list --count HEAD ^origin/main)"
+          files="$(git diff --name-only origin/main HEAD | wc -l | tr -d ' ')"
+
+          {
+            echo "Merges upstream \`$TAG\` into this fork."
+            echo
+            echo "- commits: $commits"
+            echo "- files changed: $files"
+            echo
+            echo "Merged without conflicts, so this needs review rather than"
+            echo "resolution. Worth checking in particular:"
+            echo
+            echo "- \`internal/msgqueue/\` — this fork adds the NATS JetStream"
+            echo "  backend, and a clean merge does not mean upstream has left"
+            echo "  the interfaces it implements alone"
+            echo "- \`pkg/config/\` — the NATS configuration lives alongside"
+            echo "  upstream's"
+            echo "- \`.github/workflows/\` — upstream changes here land in"
+            echo "  workflows this fork has disabled, which is harmless but"
+            echo "  worth a glance"
+            echo
+            echo "CI runs on this pull request. A green run means it builds and"
+            echo "the unit tests pass; it does not exercise the NATS backend,"
+            echo "whose tests need a JetStream server and are tagged"
+            echo "\`integration\`."
+            echo
+            echo "Opened automatically by \`.github/workflows/upstream-sync.yaml\`."
+          } > /tmp/pr-body.md
+
+          gh pr create \
+            --base main \
+            --head "$BRANCH" \
+            --title "chore: merge upstream $TAG" \
+            --body-file /tmp/pr-body.md
+
+      - name: Report conflicts
+        if: steps.state.outputs.skip == '' && steps.merge.outputs.clean == 'false'
+        env:
+          TAG: ${{ steps.target.outputs.tag }}
+          BRANCH: ${{ steps.target.outputs.branch }}
+          CONFLICTS: ${{ steps.merge.outputs.conflicts }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # A conflicted merge cannot be pushed, so there is no pull request to
+          # open. An issue naming the files is the useful artifact instead.
+          title="Upstream $TAG conflicts with this fork"
+
+          if [ "$(gh issue list --state open --search "$title in:title" --json number --jq 'length')" != "0" ]; then
+            echo "an open issue for $TAG already exists"
+            exit 0
+          fi
+
+          {
+            echo "Merging upstream \`$TAG\` into \`main\` hits conflicts, so no"
+            echo "pull request was opened — a conflicted merge cannot be pushed."
+            echo
+            echo "Conflicting files:"
+            echo
+            echo '```'
+            echo "$CONFLICTS"
+            echo '```'
+            echo
+            echo "To resolve locally:"
+            echo
+            echo '```sh'
+            echo "git fetch origin main"
+            echo "git checkout -B $BRANCH origin/main"
+            echo "git remote add upstream $UPSTREAM_URL 2>/dev/null || true"
+            echo "git fetch upstream 'refs/tags/*:refs/upstream-tags/*'"
+            echo "git merge refs/upstream-tags/$TAG"
+            echo "# resolve, then"
+            echo "git push -u origin $BRANCH"
+            echo '```'
+            echo
+            echo "Opened automatically by \`.github/workflows/upstream-sync.yaml\`."
+            echo "It will not open another issue for \`$TAG\` while this one is open."
+          } > /tmp/issue-body.md
+
+          gh issue create --title "$title" --body-file /tmp/issue-body.md
+
+      - name: Summary
+        if: always()
+        env:
+          TAG: ${{ steps.target.outputs.tag }}
+          SKIP: ${{ steps.state.outputs.skip }}
+          CLEAN: ${{ steps.merge.outputs.clean }}
+        run: |
+          {
+            echo "## Upstream sync"
+            echo
+            echo "Target release: \`${TAG:-unknown}\`"
+            echo
+
+            case "${SKIP:-}" in
+              already-merged) echo "Already contained in \`main\`; nothing to do." ;;
+              branch-exists)  echo "A sync branch for this release already exists." ;;
+              pr-exists)      echo "An open pull request for this release already exists." ;;
+              *)
+                if [ "${CLEAN:-}" = "true" ]; then
+                  echo "Merged cleanly; pull request opened."
+                elif [ "${CLEAN:-}" = "false" ]; then
+                  echo "Conflicts with this fork; issue opened."
+                else
+                  echo "Did not reach the merge step."
+                fi
+                ;;
+            esac
+          } >> "$GITHUB_STEP_SUMMARY"
