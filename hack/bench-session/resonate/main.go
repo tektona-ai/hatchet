@@ -99,10 +99,20 @@ type signal struct {
 type waitReached struct {
 	sessionID string
 	promiseID string
+	notifySeq int
 	after     time.Duration
 }
 
-var reached = make(chan waitReached, 4096)
+var (
+	reached = make(chan waitReached, 65536)
+
+	// Capacity mode holds every session at the first wait instead of settling it
+	// after a delay, so the run can be filled to N parked sessions and then
+	// released all at once.
+	capacityMode bool
+	parked       atomic.Int64
+	release      = make(chan struct{})
+)
 
 func work(info resonate.Info, input stepInput) (stepOutput, error) {
 	out := stepOutput{SessionID: input.SessionID}
@@ -117,6 +127,7 @@ func work(info resonate.Info, input stepInput) (stepOutput, error) {
 		reached <- waitReached{
 			sessionID: input.SessionID,
 			promiseID: fmt.Sprintf("%s.%d", info.OriginID(), input.NotifySeq),
+			notifySeq: input.NotifySeq,
 			after:     time.Duration(input.NotifyAfterMS) * time.Millisecond,
 		}
 	}
@@ -219,8 +230,14 @@ func main() {
 		timeoutS       = flag.Int("timeout", 1800, "seconds to wait for the measured window")
 		label          = flag.String("label", "resonate", "label for the result line")
 		outPath        = flag.String("out", "", "optional path to append a JSON result line to")
+
+		mode     = flag.String("mode", "session", "session for the latency run, capacity for the parked-session run")
+		holdS    = flag.Int("hold-seconds", 30, "capacity mode: how long to hold every session parked before releasing")
+		fillWait = flag.Int("fill-timeout", 600, "capacity mode: seconds to wait for every session to park")
 	)
 	flag.Parse()
+
+	capacityMode = *mode == "capacity"
 
 	r, err := resonate.New(resonate.Config{URL: *url})
 	if err != nil {
@@ -283,6 +300,12 @@ func main() {
 		return nil
 	}
 
+	if capacityMode {
+		runCapacity(ctx, *label, run, *n, *holdS, *fillWait, &mu, &wakes, *outPath)
+
+		return
+	}
+
 	log.Printf("[%s] warmup: %d session starts", *label, *warmup)
 
 	if _, err := drive(ctx, run, *warmup, min(*concurrency, *warmup)); err != nil {
@@ -326,10 +349,21 @@ func runController(ctx context.Context, r *resonate.Resonate) {
 			return
 		case req := <-reached:
 			go func(req waitReached) {
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(req.after):
+				if capacityMode && req.notifySeq == seqSandboxRunning {
+					// Park here and stay parked until the run is released.
+					parked.Add(1)
+
+					select {
+					case <-ctx.Done():
+						return
+					case <-release:
+					}
+				} else {
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(req.after):
+					}
 				}
 
 				for attempt := range 100 {
@@ -355,6 +389,105 @@ func runController(ctx context.Context, r *resonate.Resonate) {
 			}(req)
 		}
 	}
+}
+
+// runCapacity starts n session starts at once, waits for every one of them to
+// park on the first wait, holds them there, then releases them together. What it
+// measures is how many sessions an engine will hold parked and what it costs to
+// wake all of them.
+func runCapacity(ctx context.Context, label string, run func(context.Context) error, n, holdS, fillWait int, mu *sync.Mutex, wakes *[]sessionOutput, outPath string) {
+	var (
+		wg       sync.WaitGroup
+		failed   atomic.Int64
+		firstErr atomic.Value
+	)
+
+	log.Printf("[%s] filling: starting %d sessions", label, n)
+
+	fillStart := time.Now()
+
+	for range n {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			if err := run(ctx); err != nil {
+				failed.Add(1)
+				firstErr.CompareAndSwap(nil, err.Error())
+			}
+		}()
+	}
+
+	deadline := time.Now().Add(time.Duration(fillWait) * time.Second)
+	for parked.Load() < int64(n) && time.Now().Before(deadline) && ctx.Err() == nil {
+		time.Sleep(250 * time.Millisecond)
+	}
+
+	fill := time.Since(fillStart)
+	peak := parked.Load()
+
+	log.Printf("[%s] parked %d/%d after %.1fs", label, peak, n, fill.Seconds())
+
+	log.Printf("[%s] holding for %ds", label, holdS)
+	time.Sleep(time.Duration(holdS) * time.Second)
+
+	held := parked.Load()
+
+	log.Printf("[%s] releasing", label)
+
+	releaseStart := time.Now()
+	close(release)
+
+	wg.Wait()
+
+	drain := time.Since(releaseStart)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	running := make([]float64, 0, len(*wakes))
+	for _, w := range *wakes {
+		running = append(running, w.WakeRunningMS)
+	}
+
+	sort.Float64s(running)
+
+	res := map[string]any{
+		"label":          label,
+		"engine":         "resonate",
+		"mode":           "capacity",
+		"requested":      n,
+		"parked_peak":    peak,
+		"parked_at_hold": held,
+		"completed":      len(*wakes),
+		"failed":         failed.Load(),
+		"fill_seconds":   fill.Seconds(),
+		"hold_seconds":   holdS,
+		"drain_seconds":  drain.Seconds(),
+		"wake_p50_ms":    pctF(running, 0.50),
+		"wake_p95_ms":    pctF(running, 0.95),
+		"wake_max_ms":    lastF(running),
+	}
+
+	if e := firstErr.Load(); e != nil {
+		res["first_error"] = e
+	}
+
+	fmt.Printf("\n=== %s capacity ===\n", label)
+	fmt.Printf("requested    %d\n", n)
+	fmt.Printf("parked       %d at peak, %d still parked after the hold\n", peak, held)
+	fmt.Printf("fill         %.1fs\n", fill.Seconds())
+	fmt.Printf("drain        %.1fs after release\n", drain.Seconds())
+	fmt.Printf("completed    %d, failed %d\n", len(*wakes), failed.Load())
+	fmt.Printf("wake         p50=%.0fms p95=%.0fms max=%.0fms\n",
+		res["wake_p50_ms"], res["wake_p95_ms"], res["wake_max_ms"])
+
+	if e := firstErr.Load(); e != nil {
+		fmt.Printf("first error  %v\n", e)
+	}
+
+	writeResult(res, outPath)
 }
 
 // drive runs count session starts with at most concurrency in flight and
@@ -453,6 +586,10 @@ func report(label, engine string, n, concurrency, workMS int, total time.Duratio
 		res["wake_running_p50_ms"], res["wake_running_p95_ms"],
 		res["wake_connected_p50_ms"], res["wake_connected_p95_ms"])
 
+	writeResult(res, outPath)
+}
+
+func writeResult(res map[string]any, outPath string) {
 	if outPath == "" {
 		return
 	}
@@ -468,6 +605,14 @@ func report(label, engine string, n, concurrency, workMS int, total time.Duratio
 	if err := json.NewEncoder(f).Encode(res); err != nil {
 		log.Printf("could not encode result line: %v", err)
 	}
+}
+
+func lastF(sorted []float64) float64 {
+	if len(sorted) == 0 {
+		return 0
+	}
+
+	return sorted[len(sorted)-1]
 }
 
 func pct(sorted []time.Duration, p float64) time.Duration {

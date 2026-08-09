@@ -122,10 +122,48 @@ the worker and Postgres together is too few for Hatchet, so read this as a
 symptom of the box, not of the design — but it is the one number worth re-running
 on real hardware before deciding.
 
-## What this does not measure
+## Capacity: how many sessions can be parked at once
 
-Holding thousands of parked sessions. Every wait here is satisfied within a
-second or two. A session parked on a human review for hours is a different
-question: whether the run keeps a worker slot, and what it costs to hold. Hatchet
-answers with an eviction policy and `Runs().Restore`; Resonate suspends the task
-and the worker keeps nothing. That comparison still needs writing.
+`-mode capacity` starts N sessions at once, waits for every one to park on the
+first wait, holds them there, then releases them all together. It answers the
+question the latency run does not: how many sessions can be waiting, and what
+does it cost to wake them.
+
+Same box, 16 durable slots on the Hatchet worker, a default Resonate worker,
+20 second hold:
+
+| engine | sessions | parked | fill | drain | wake p50 / max | failed |
+|---|---:|---:|---:|---:|---:|---:|
+| Hatchet, no eviction | 64 | **13** | 300 s (gave up) | 2.0 s | 245 / 347 ms | **51** |
+| Hatchet, eviction 3 s | 64 | 64 | 16.0 s | 8.9 s | 4592 / 7648 ms | 0 |
+| Hatchet, eviction 3 s | 256 | 256 | 77.0 s | 25.3 s | 12744 / 24185 ms | 0 |
+| Resonate | 64 | 64 | 0.5 s | 1.8 s | 179 / 340 ms | 0 |
+| Resonate | 256 | 256 | 0.8 s | 3.7 s | 859 / 1234 ms | 0 |
+
+**A parked Hatchet session holds a durable slot.** With eviction off, 16 slots
+held 13 sessions and the other 51 queued behind them until they timed out. That
+ceiling is configuration, not a hard limit — size the fleet's durable slots to
+peak parked sessions and it goes away. What this run does not tell you is what a
+held slot costs the worker in memory, which is the number you need before setting
+that figure to thousands.
+
+**Eviction lifts the ceiling and costs seconds to come back.** With a 3 second
+eviction TTL, 256 sessions parked on a 16-slot worker. Waking them cost 12.7 s at
+p50 and 24 s at the tail, against 0.9 s and 1.2 s for Resonate.
+
+**Resonate parks for almost nothing.** The workflow suspends, the task goes back
+to the server, the worker holds no state. 256 parked in 0.8 s, and filling scales
+nearly flat where Hatchet's is linear at roughly 0.3 s per session.
+
+Read the absolute times with the box in mind — four cores running the engine, the
+worker and Postgres together starves Hatchet. The structural difference does not
+come from the box: Hatchet parks in a worker slot and restores an evicted run
+through the queue, Resonate parks in the server.
+
+## A signal sent too early is missed
+
+Both engines match a signal only once the workflow has registered its wait. An
+earlier version of the capacity run set every delay to 10 ms, so the second signal
+was pushed before the workflow reached the second wait, and the run hung with no
+error anywhere. If a capacity run stalls, check that the signal delays are longer
+than the time the workflow needs to get to the wait.
