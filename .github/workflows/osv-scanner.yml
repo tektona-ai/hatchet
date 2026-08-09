@@ -1,11 +1,18 @@
+# Disabled in this fork.
+#
+# Upstream's automation cannot run here: it targets ghcr.io/hatchet-dev, uses
+# self-hosted runners (hatchet-arm64-2, ubicloud-*) that this repository does
+# not have, publishes packages with secrets it does not hold, or automates the
+# upstream project's own issue and PR triage.
+#
+# Only the automatic triggers are removed; any existing workflow_dispatch block
+# is kept verbatim so manual runs still work and expressions that reference its
+# inputs still resolve. Files are not deleted, so the body stays identical to
+# upstream and merges stay clean.
 name: OSV-Scanner
 
 on:
-  pull_request:
-    branches: ["main"]
-  push:
-    branches: ["main"]
-
+  workflow_dispatch:
 permissions:
   actions: read
   security-events: write

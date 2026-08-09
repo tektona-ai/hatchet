@@ -1,20 +1,17 @@
+# Disabled in this fork.
+#
+# Upstream's automation cannot run here: it targets ghcr.io/hatchet-dev, uses
+# self-hosted runners (hatchet-arm64-2, ubicloud-*) that this repository does
+# not have, publishes packages with secrets it does not hold, or automates the
+# upstream project's own issue and PR triage.
+#
+# Only the automatic triggers are removed; any existing workflow_dispatch block
+# is kept verbatim so manual runs still work and expressions that reference its
+# inputs still resolve. Files are not deleted, so the body stays identical to
+# upstream and merges stay clean.
 name: scheduler-sync
 on:
-  pull_request:
-    paths:
-      - "pkg/scheduling/**"
-      - "hack/ci/check-scheduler-sync.sh"
-      - ".github/workflows/scheduler-sync.yml"
-  push:
-    branches:
-      - main
-    paths:
-      - "pkg/scheduling/**"
-
-# While the v1alpha scheduler is rolling out, pkg/scheduling/v1 and
-# pkg/scheduling/v1alpha must be kept in sync: shared files identical, and
-# scheduler-core changes ported to both implementations. See
-# hack/ci/check-scheduler-sync.sh for the rules.
+  workflow_dispatch:
 jobs:
   check-sync:
     runs-on: ubuntu-latest
