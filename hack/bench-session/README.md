@@ -122,6 +122,30 @@ the worker and Postgres together is too few for Hatchet, so read this as a
 symptom of the box, not of the design — but it is the one number worth re-running
 on real hardware before deciding.
 
+## Running it yourself
+
+`run-scale.sh` does the whole cycle for one engine — reset the database, start
+it, run one cell, sample memory, print the result. It works on macOS and Linux.
+
+```sh
+docker compose up -d postgres nats
+
+./hack/bench-session/run-scale.sh hatchet  capacity 1000
+./hack/bench-session/run-scale.sh resonate capacity 4000
+./hack/bench-session/run-scale.sh hatchet  session  32
+```
+
+The Resonate side needs a `resonate` server binary built from
+https://github.com/resonatehq/resonate; point `RESONATE_BIN` at it.
+
+Two rules the numbers depend on:
+
+- **Start from a clean database every time.** Runs left over from an earlier
+  attempt are retried by the engine and inherited by the next worker that
+  connects. That load is invisible in the results and looks exactly like the
+  engine falling over — it cost hours here before it was spotted.
+- **One engine at a time.** Both do background work when idle.
+
 ## Capacity: how many sessions can be parked at once
 
 `-mode capacity` starts N sessions at once, waits for every one to park on the
@@ -159,6 +183,49 @@ Read the absolute times with the box in mind — four cores running the engine, 
 worker and Postgres together starves Hatchet. The structural difference does not
 come from the box: Hatchet parks in a worker slot and restores an evicted run
 through the queue, Resonate parks in the server.
+
+### Correction to the table above
+
+Those eviction rows were measured on a database still holding runs from earlier
+attempts, so read them as a warning about the eviction path, not as Hatchet's
+capacity. Re-run from a clean database gave a different answer: sizing durable
+slots to the fleet is both simpler and much faster than turning eviction on.
+
+## Thousands of sessions, from a clean database
+
+Hatchet given durable slots for every session — which is how you would actually
+run it — against Resonate, which has no equivalent setting. 45 second hold.
+
+| engine | sessions | parked | fill | drain | wake p50 / max | failed | worker / server peak |
+|---|---:|---:|---:|---:|---:|---:|---|
+| Hatchet | 1000 | 1000 | 20.3 s | 64.5 s | 8271 / 14795 ms | 0 | 150 / 408 MB |
+| Resonate | 1000 | 1000 | 2.5 s | 15.4 s | 2793 / 10673 ms | 0 | 122 / 144 MB |
+| Hatchet | 4000 | 4000 | 98.3 s | did not finish | — | — | 385 / 466 MB |
+| Resonate | 4000 | 4000 | 16.3 s | 82.4 s | 20553 / 71588 ms | 0 | 433 / 409 MB |
+
+**Both hold thousands of parked sessions.** 4000 parked with zero failures on
+either engine, on four cores.
+
+**Filling is where they separate.** Resonate is 6 to 8 times faster to get
+sessions parked — 2.5 s against 20.3 s at 1000, 16.3 s against 98.3 s at 4000.
+
+**Memory per parked session is small.** Resonate's 1000-to-4000 step adds about
+104 KB per session in the worker and 88 KB in the server, so roughly 190 KB
+all-in: 10,000 sessions is about 2 GB. Hatchet's engine holds more at the same
+count — 408 MB against 144 MB at 1000.
+
+**Waking everything at once is the limit on both.** Hatchet took 64.5 s to drain
+1000; at 4000 it had not drained after 25 minutes and the run was stopped, so
+that cell has no number. Resonate drained 4000 in 82.4 s but with a 72 s tail.
+
+This is the case worth designing around rather than benchmarking further: sessions
+normally arrive spread over time and sit parked, which both engines do well. A
+whole fleet waking at once — a runner restart, a region reconnecting — is the
+expensive event, and staggering it is cheaper than making either engine faster.
+
+Four cores shared between the engine, the worker and Postgres is the smallest
+plausible machine for this. Engine-bound figures — Hatchet's fill and drain
+especially — are the ones that should improve most on real hardware.
 
 ## A signal sent too early is missed
 
