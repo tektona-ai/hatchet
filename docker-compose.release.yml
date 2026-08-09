@@ -1,11 +1,11 @@
 services:
   hatchet-migrate:
-    image: ghcr.io/hatchet-dev/hatchet/hatchet-migrate:${LATEST_TAG}
+    image: ghcr.io/tektona-ai/hatchet/hatchet-migrate:${LATEST_TAG}
     environment:
       DATABASE_URL: "postgresql://hatchet:hatchet@postgres:5432/hatchet?sslmode=disable"
 
   hatchet-admin:
-    image: ghcr.io/hatchet-dev/hatchet/hatchet-admin:${LATEST_TAG}
+    image: ghcr.io/tektona-ai/hatchet/hatchet-admin:${LATEST_TAG}
     environment:
       DATABASE_URL: "postgresql://hatchet:hatchet@postgres:5432/hatchet?sslmode=disable"
       SERVER_PORT: "8080"
@@ -21,7 +21,7 @@ services:
       - ./generated:/hatchet/generated
 
   hatchet-engine:
-    image: ghcr.io/hatchet-dev/hatchet/hatchet-engine:${LATEST_TAG}
+    image: ghcr.io/tektona-ai/hatchet/hatchet-engine:${LATEST_TAG}
     command: /hatchet/hatchet-engine --config /hatchet/generated
     restart: on-failure
     ports:
@@ -47,7 +47,7 @@ services:
       - ./generated:/hatchet/generated
 
   hatchet-api:
-    image: ghcr.io/hatchet-dev/hatchet/hatchet-api:${LATEST_TAG}
+    image: ghcr.io/tektona-ai/hatchet/hatchet-api:${LATEST_TAG}
     command: /hatchet/hatchet-api --config /hatchet/generated
     restart: on-failure
     ports:
