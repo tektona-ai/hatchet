@@ -1,0 +1,14 @@
+# actionlint cannot know about runner labels that are not GitHub-hosted, and
+# reports every use of one as an unknown label. Upstream's workflows target a
+# self-hosted arm64 box and Ubicloud runners; declaring the labels here keeps
+# those reports out of the way of real findings.
+#
+# This repository has none of these runners, which is why the workflows using
+# them are disabled rather than merely unlinted.
+self-hosted-runner:
+  labels:
+    - hatchet-arm64-2
+    - ubicloud-standard-2
+    - ubicloud-standard-4
+    - ubicloud-standard-8
+    - ubicloud-standard-16

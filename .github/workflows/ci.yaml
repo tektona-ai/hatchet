@@ -1,0 +1,132 @@
+name: CI
+
+# Pull-request signal for this fork.
+#
+# Upstream's test.yml is disabled here because it targets ubicloud runners this
+# repository does not have. This is a deliberately smaller replacement that runs
+# on stock GitHub runners.
+#
+# `go vet ./...` is not run. Upstream's tree does not currently pass it -- two
+# context-leak findings in pkg/config/loader/loader.go predate this fork -- so a
+# vet step would fail on day one for reasons unrelated to any change under
+# review. Worth revisiting if those are ever fixed upstream.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build and format
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Check formatting
+        run: |
+          set -euo pipefail
+
+          unformatted="$(gofmt -l . | grep -v node_modules || true)"
+
+          if [ -n "$unformatted" ]; then
+            echo "these files are not gofmt'd:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+
+  unit:
+    name: unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      # Everything except the packages that stand up containers, which run in
+      # the job below. Splitting them keeps the fast signal readable and lets
+      # the slower job be dropped on its own if it proves flaky.
+      - name: Test
+        run: |
+          set -euo pipefail
+
+          go test -count=1 $(
+            go list ./... \
+              | grep -v "quickstart" \
+              | grep -vE "/(internal/services/ticker|pkg/repository|pkg/scheduling/v1|pkg/testing/harness)$"
+          )
+
+  container-tests:
+    name: container-backed tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      # These use testcontainers to bring up Postgres, so they need a Docker
+      # daemon. They are split out because they are the slowest and the most
+      # likely to be flaky on a small runner.
+      - name: Test
+        run: |
+          set -euo pipefail
+
+          go test -count=1 \
+            ./internal/services/ticker/... \
+            ./pkg/repository \
+            ./pkg/scheduling/v1 \
+            ./pkg/testing/harness
+
+  workflows:
+    name: lint workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Install actionlint
+        run: go install github.com/rhysd/actionlint/cmd/actionlint@latest
+
+      - name: Lint workflows
+        run: |
+          set -euo pipefail
+
+          # Two findings predate this fork and live in workflows that are
+          # disabled here: a constant `if: false` in auto-merge.yml and a
+          # reference to an undefined matrix.test-cmd in sdk-typescript.yml.
+          # Custom runner labels are declared in .github/actionlint.yaml.
+          for f in .github/workflows/*.y*ml; do
+            "$(go env GOPATH)/bin/actionlint" \
+              -ignore "constant expression" \
+              -ignore "test-cmd" \
+              "$f"
+          done
