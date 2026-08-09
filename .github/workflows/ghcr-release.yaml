@@ -1,0 +1,243 @@
+name: Release to GHCR
+
+# Publishes this fork's server images to GHCR under the repository owner's
+# namespace.
+#
+# This exists alongside upstream's pre-release.yaml/release.yaml rather than
+# replacing them: those push to ghcr.io/hatchet-dev/... and schedule arm64 jobs
+# on a self-hosted `hatchet-arm64-2` runner, neither of which a fork has. They
+# should be disabled in the Actions UI so a tag push does not start builds that
+# cannot succeed.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Git tag to build, e.g. v0.94.16-nats.1"
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+# A tag is built once. A second run for the same tag would race the first to
+# publish the same image reference.
+concurrency:
+  group: ghcr-release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  prepare:
+    name: prepare
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      is_stable: ${{ steps.resolve.outputs.is_stable }}
+      namespace: ${{ steps.resolve.outputs.namespace }}
+    steps:
+      - name: Resolve tag and namespace
+        id: resolve
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+
+          tag="${INPUT_TAG:-$REF_NAME}"
+
+          if [ -z "$tag" ]; then
+            echo "could not resolve a tag to build" >&2
+            exit 1
+          fi
+
+          # Only an exact vX.Y.Z moves the :latest pointer. Pre-release tags
+          # (v1.2.3-nats.1) publish under their own name and nothing else, so
+          # cutting one never changes what an untagged pull resolves to.
+          if echo "$tag" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            is_stable=true
+          else
+            is_stable=false
+          fi
+
+          # GHCR paths are case-sensitive and must be lowercase, while a GitHub
+          # owner may contain capitals.
+          namespace="$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')/hatchet"
+
+          {
+            echo "tag=$tag"
+            echo "is_stable=$is_stable"
+            echo "namespace=$namespace"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "building $tag (stable=$is_stable) into ${REGISTRY:-ghcr.io}/$namespace"
+
+  servers:
+    name: ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    needs: [prepare]
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every server binary comes out of the same Dockerfile, selected by
+        # SERVER_TARGET. image is spelled out rather than derived so the job
+        # name in the UI reads as the artifact it produces.
+        include:
+          - target: engine
+            image: hatchet-engine
+          - target: api
+            image: hatchet-api
+          - target: admin
+            image: hatchet-admin
+          - target: migrate
+            image: hatchet-migrate
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Built as a step rather than inline so the tag list never contains a
+      # blank entry when :latest is skipped.
+      - name: Compute tags
+        id: tags
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ needs.prepare.outputs.namespace }}/${{ matrix.image }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          STABLE: ${{ needs.prepare.outputs.is_stable }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "tags<<EOF"
+            echo "${IMAGE}:${TAG}"
+            if [ "$STABLE" = "true" ]; then
+              echo "${IMAGE}:latest"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./build/package/servers.dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          build-args: |
+            SERVER_TARGET=${{ matrix.target }}
+            VERSION=${{ needs.prepare.outputs.tag }}
+          tags: ${{ steps.tags.outputs.tags }}
+          # Scoped per image so one target's cache cannot evict another's.
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+  dashboard:
+    name: hatchet-dashboard
+    runs-on: ubuntu-latest
+    # The dashboard image copies the compiled hatchet-api binary out of the API
+    # image, so that image has to exist in the registry first.
+    needs: [prepare, servers]
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: tags
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ needs.prepare.outputs.namespace }}/hatchet-dashboard
+          TAG: ${{ needs.prepare.outputs.tag }}
+          STABLE: ${{ needs.prepare.outputs.is_stable }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "tags<<EOF"
+            echo "${IMAGE}:${TAG}"
+            if [ "$STABLE" = "true" ]; then
+              echo "${IMAGE}:latest"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./build/package/dashboard.dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          build-args: |
+            HATCHET_API_IMAGE=${{ env.REGISTRY }}/${{ needs.prepare.outputs.namespace }}/hatchet-api:${{ needs.prepare.outputs.tag }}
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha,scope=hatchet-dashboard
+          cache-to: type=gha,mode=max,scope=hatchet-dashboard
+
+  summary:
+    name: summary
+    runs-on: ubuntu-latest
+    needs: [prepare, servers, dashboard]
+    if: always()
+    steps:
+      - name: Report published images
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          NAMESPACE: ${{ needs.prepare.outputs.namespace }}
+          STABLE: ${{ needs.prepare.outputs.is_stable }}
+          SERVERS_RESULT: ${{ needs.servers.result }}
+          DASHBOARD_RESULT: ${{ needs.dashboard.result }}
+        run: |
+          {
+            echo "## Images"
+            echo
+            echo "servers: \`$SERVERS_RESULT\` · dashboard: \`$DASHBOARD_RESULT\`"
+            echo
+            for img in hatchet-engine hatchet-api hatchet-admin hatchet-migrate hatchet-dashboard; do
+              echo "- \`${REGISTRY}/${NAMESPACE}/${img}:${TAG}\`"
+            done
+            echo
+            if [ "$STABLE" = "true" ]; then
+              echo "\`:latest\` was moved to \`${TAG}\`."
+            else
+              echo "\`${TAG}\` is a pre-release tag, so \`:latest\` was left untouched."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Fail the run if anything upstream of here failed, so a partial
+          # publish is not reported as a green release.
+          if [ "$SERVERS_RESULT" != "success" ] || [ "$DASHBOARD_RESULT" != "success" ]; then
+            echo "one or more image builds failed" >&2
+            exit 1
+          fi
