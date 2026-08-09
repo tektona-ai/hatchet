@@ -34,6 +34,10 @@ import (
 const (
 	eventSandboxRunning   = "sandbox:running"
 	eventRuntimeConnected = "runtime:connected"
+
+	// How often the controller repeats an announcement, and how many times.
+	signalRepeats     = 6
+	signalRepeatEvery = 5 * time.Second
 )
 
 type stepInput struct {
@@ -389,12 +393,28 @@ func runController(ctx context.Context, client *hatchet.Client) {
 					}
 				}
 
-				err := client.Events().Push(ctx, req.eventKey, signal{
-					SessionID:      req.sessionID,
-					SentAtUnixNano: time.Now().UnixNano(),
-				})
-				if err != nil && ctx.Err() == nil {
-					log.Printf("failed to push %s for %s: %v", req.eventKey, req.sessionID, err)
+				// An event only reaches a workflow that has already registered
+				// its wait; one pushed a moment too early is dropped and the
+				// session waits forever. The workflow can be slow to get there
+				// under load, so the controller repeats the announcement the way
+				// a reconciler reporting current state would. Repeats after the
+				// wait is satisfied match nothing.
+				for attempt := range signalRepeats {
+					if attempt > 0 {
+						select {
+						case <-ctx.Done():
+							return
+						case <-time.After(signalRepeatEvery):
+						}
+					}
+
+					err := client.Events().Push(ctx, req.eventKey, signal{
+						SessionID:      req.sessionID,
+						SentAtUnixNano: time.Now().UnixNano(),
+					})
+					if err != nil && ctx.Err() == nil {
+						log.Printf("failed to push %s for %s: %v", req.eventKey, req.sessionID, err)
+					}
 				}
 			}(req)
 		}
