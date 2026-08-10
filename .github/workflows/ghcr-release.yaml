@@ -104,6 +104,13 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.tag }}
 
+      - name: Set up QEMU
+        # The Go build cross-compiles natively, but the runtime stage runs apk
+        # as the target architecture, so that step still needs emulation.
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -139,7 +146,11 @@ jobs:
         with:
           context: .
           file: ./build/package/servers.dockerfile
-          platforms: linux/amd64
+          # arm64 as well as amd64: an amd64 image on an arm64 node runs under
+          # emulation, and Go's runtime does not survive it — the GC, slice
+          # headers and cached HMAC state corrupt at random. Apple Silicon dev
+          # machines are arm64.
+          platforms: linux/amd64,linux/arm64
           push: true
           provenance: false
           build-args: |
@@ -175,6 +186,13 @@ jobs:
         working-directory: frontend/snippets
         run: python3 generate.py
 
+      - name: Set up QEMU
+        # The Go build cross-compiles natively, but the runtime stage runs apk
+        # as the target architecture, so that step still needs emulation.
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -208,7 +226,11 @@ jobs:
         with:
           context: .
           file: ./build/package/dashboard.dockerfile
-          platforms: linux/amd64
+          # arm64 as well as amd64: an amd64 image on an arm64 node runs under
+          # emulation, and Go's runtime does not survive it — the GC, slice
+          # headers and cached HMAC state corrupt at random. Apple Silicon dev
+          # machines are arm64.
+          platforms: linux/amd64,linux/arm64
           push: true
           provenance: false
           build-args: |

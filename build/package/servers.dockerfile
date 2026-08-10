@@ -1,6 +1,9 @@
 # Base Go environment
 # -------------------
-FROM golang:1.26-alpine as base
+# --platform=$BUILDPLATFORM keeps the Go toolchain running natively on the
+# builder. Without it a multi-arch build emulates the whole compile, which is
+# both very slow and needless: Go cross-compiles, so only GOARCH has to change.
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS base
 WORKDIR /hatchet
 
 ENV CGO_ENABLED=0
@@ -26,7 +29,7 @@ RUN go generate ./...
 
 # OpenAPI bundle environment (uses openapi-core only to avoid Redoc/React/styled-components)
 # ----------------------------------------------------------------------------------------
-FROM node:24-alpine AS build-openapi
+FROM --platform=$BUILDPLATFORM node:24-alpine AS build-openapi
 WORKDIR /openapi
 
 COPY /api-contracts/openapi ./openapi
@@ -64,9 +67,17 @@ COPY --from=build-openapi /openapi/bin/oas/openapi.yaml ./bin/oas/openapi.yaml
 # build oapi
 RUN oapi-codegen -config ./api/v1/server/oas/gen/codegen.yaml ./bin/oas/openapi.yaml
 
+# Buildx sets these to the image being produced, not the machine building it.
+# The binary has to be built for the target: an amd64 binary on an arm64 node
+# runs under emulation, and Go's runtime does not survive that — the garbage
+# collector, slice headers and cached HMAC state all corrupt at random.
+ARG TARGETOS
+ARG TARGETARCH
+
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=$GOPATH/pkg/mod \
     if [ "$FIPS" = "true" ]; then export GOFIPS140=v1.0.0; fi && \
+    GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -tags="${GO_BUILD_TAGS}" -ldflags="-w -s -X 'main.Version=${VERSION}'" -a -o ./bin/hatchet-${SERVER_TARGET} ./cmd/hatchet-${SERVER_TARGET} && \
     if [ "$FIPS" = "true" ]; then \
       go version -m ./bin/hatchet-${SERVER_TARGET} | grep -q 'GOFIPS140=v1.0.0-c2097c7c$' && go version -m ./bin/hatchet-${SERVER_TARGET} | grep -Eq 'DefaultGODEBUG=.*fips140=on(,|$)' || { echo "hatchet-${SERVER_TARGET} is not linked against the validated FIPS module"; exit 1; }; \
