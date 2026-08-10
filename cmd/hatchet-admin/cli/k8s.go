@@ -251,19 +251,6 @@ func runCreateWorkerToken() error {
 
 	defer server.Disconnect() // nolint:errcheck
 
-	expiresAt := time.Now().UTC().Add(100 * 365 * 24 * time.Hour)
-
-	tenantId, err := tenantIDForTokenCreate(server.Seed.DefaultTenantID)
-	if err != nil {
-		return err
-	}
-
-	defaultTok, err := server.Auth.JWTManager.GenerateTenantToken(context.Background(), tenantId, tokenName, false, &expiresAt)
-
-	if err != nil {
-		return err
-	}
-
 	var c *configModifier
 	var exists bool
 
@@ -293,6 +280,32 @@ func runCreateWorkerToken() error {
 			exists = configMap != nil
 			c = newFromConfigMap(configMap, k8sClientConfigName)
 		}
+	}
+
+	// Leave a token that is already there alone. The token this mints never
+	// expires and nothing revokes the one it would replace, so minting on every
+	// run leaves a trail of live credentials — and everything already holding
+	// the old one keeps using it, so the new one buys nothing.
+	//
+	// This command runs from a Job, and a Job re-runs whenever its Pod template
+	// changes or it is recreated after a failure. Being a no-op when the token
+	// exists is what makes those re-runs safe.
+	if exists && c.get("HATCHET_CLIENT_TOKEN") != "" {
+		fmt.Printf("%s already has HATCHET_CLIENT_TOKEN, leaving it unchanged\n", k8sClientConfigName)
+		return nil
+	}
+
+	expiresAt := time.Now().UTC().Add(100 * 365 * 24 * time.Hour)
+
+	tenantId, err := tenantIDForTokenCreate(server.Seed.DefaultTenantID)
+	if err != nil {
+		return err
+	}
+
+	defaultTok, err := server.Auth.JWTManager.GenerateTenantToken(context.Background(), tenantId, tokenName, false, &expiresAt)
+
+	if err != nil {
+		return err
 	}
 
 	c.set("HATCHET_CLIENT_TOKEN", defaultTok.Token)
