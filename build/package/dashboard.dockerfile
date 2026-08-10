@@ -3,10 +3,15 @@
 ARG HATCHET_API_IMAGE
 
 # Stage 1: copy from the existing Go built image
-FROM $HATCHET_API_IMAGE as api-binary-base
+# Resolved per target platform, so an arm64 image takes the arm64 binary.
+FROM $HATCHET_API_IMAGE AS api-binary-base
 
 # Stage 2: build the frontend
-FROM node:22-alpine as frontend-build
+# --platform=$BUILDPLATFORM: the bundle this stage produces is just files, the
+# same for every target, so building it once on the builder's own architecture
+# is both correct and the only thing that works. Emulated, pnpm dies with
+# `qemu: uncaught target signal 4 (Illegal instruction)` and the build fails.
+FROM --platform=$BUILDPLATFORM node:22-alpine AS frontend-build
 
 WORKDIR /app
 
