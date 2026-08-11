@@ -19,6 +19,11 @@ import (
 	"github.com/google/uuid"
 )
 
+// queueCacheTTL is how long a queue stays in queueCache after its last_active timestamp
+// was written. While a queue is cached, task inserts skip the upsert, so last_active can
+// be this far behind on a tenant that is working the whole time.
+const queueCacheTTL = 5 * time.Minute
+
 // implements comparable for the lru cache
 type taskExternalIdTenantIdTuple struct {
 	externalId uuid.UUID
@@ -61,7 +66,7 @@ func newSharedRepository(
 	cacheDuration time.Duration,
 ) (*sharedRepository, func() error) {
 	queries := sqlcv1.New()
-	queueCache := cache.New(5 * time.Minute)
+	queueCache := cache.New(queueCacheTTL)
 	stepExpressionCache := cache.New(5 * time.Minute)
 	concurrencyStrategyCache := cache.New(5 * time.Minute)
 	payloadStore := NewPayloadStoreRepository(pool, l, queries, payloadStoreOpts)

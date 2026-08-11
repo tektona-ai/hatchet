@@ -1349,11 +1349,18 @@ func (r *TaskRepositoryImpl) ListTaskMetas(ctx context.Context, tenantId uuid.UU
 	})
 }
 
-// DefaultTaskActivityGauge is a heavily cached method that returns the number of queues that have had activity since
-// the task retention period.
+// queueActivityWindow is how far back DefaultTaskActivityGauge looks for queue activity.
+// It has to stay well above queueCacheTTL, because that is how far behind last_active can
+// be on a tenant that is working the whole time. Reading a working tenant as idle makes
+// the controller loops back off while there is still work to do.
+const queueActivityWindow = 3 * queueCacheTTL
+
+// DefaultTaskActivityGauge returns the number of queues that have had activity within
+// queueActivityWindow. The controller operation pools use it to decide whether to keep
+// polling this tenant at the start interval or to back off, so it has to answer whether
+// the tenant is working now — not whether it has ever worked.
 func (r *TaskRepositoryImpl) DefaultTaskActivityGauge(ctx context.Context, tenantId string) (int, error) {
-	today := time.Now().UTC()
-	notBefore := today.Add(-1 * r.taskRetentionPeriod)
+	notBefore := time.Now().UTC().Add(-queueActivityWindow)
 	tenantIdUuid, err := uuid.Parse(tenantId)
 	if err != nil {
 		return 0, err
