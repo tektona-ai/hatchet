@@ -23,14 +23,23 @@ import (
 	"github.com/hatchet-dev/hatchet/pkg/repository/sqlcv1"
 )
 
-type stubAPITokenRepository struct{}
+// stubAPITokenRepository answers GetAPITokenById from its fields. The zero value returns a
+// live, unrevoked token for every id.
+type stubAPITokenRepository struct {
+	getErr  error
+	revoked bool
+}
 
 func (s *stubAPITokenRepository) CreateAPIToken(ctx context.Context, opts *v1.CreateAPITokenOpts) (*sqlcv1.APIToken, error) {
 	return &sqlcv1.APIToken{ID: opts.ID, ExpiresAt: pgtype.Timestamp{Time: opts.ExpiresAt, Valid: true}}, nil
 }
 
 func (s *stubAPITokenRepository) GetAPITokenById(ctx context.Context, id uuid.UUID) (*sqlcv1.APIToken, error) {
-	return &sqlcv1.APIToken{ID: id, Revoked: false, ExpiresAt: pgtype.Timestamp{Time: time.Now().Add(24 * time.Hour), Valid: true}}, nil
+	if s.getErr != nil {
+		return nil, s.getErr
+	}
+
+	return &sqlcv1.APIToken{ID: id, Revoked: s.revoked, ExpiresAt: pgtype.Timestamp{Time: time.Now().Add(24 * time.Hour), Valid: true}}, nil
 }
 
 func (s *stubAPITokenRepository) ListAPITokensByTenant(ctx context.Context, tenantId uuid.UUID) ([]*sqlcv1.APIToken, error) {
