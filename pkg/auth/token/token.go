@@ -2,14 +2,28 @@ package token
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/tink-crypto/tink-go/jwt"
 
 	"github.com/hatchet-dev/hatchet/pkg/encryption"
 	v1 "github.com/hatchet-dev/hatchet/pkg/repository"
+)
+
+var (
+	// ErrTokenNotInDatabase means the signature is good but the "APIToken" row the
+	// token_id claim points at is gone. A token minted against a database that was
+	// later re-created reads this way, and so does one minted against a different
+	// database. Callers can tell it apart from a database that is merely unreachable.
+	ErrTokenNotInDatabase = errors.New("token is not in the database")
+
+	// ErrTokenRevoked means an operator revoked the token. It is a deliberate act,
+	// so callers must not treat it as a token to replace.
+	ErrTokenRevoked = errors.New("token has been revoked")
 )
 
 type JWTManager interface {
@@ -157,11 +171,15 @@ func (j *jwtManagerImpl) ValidateTenantToken(ctx context.Context, token string) 
 	dbToken, err := j.tokenRepo.GetAPITokenById(ctx, tokenIdUuid)
 
 	if err != nil {
-		return uuid.Nil, uuid.Nil, fmt.Errorf("failed to read token from database: %v", err)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return uuid.Nil, uuid.Nil, ErrTokenNotInDatabase
+		}
+
+		return uuid.Nil, uuid.Nil, fmt.Errorf("failed to read token from database: %w", err)
 	}
 
 	if dbToken.Revoked {
-		return uuid.Nil, uuid.Nil, fmt.Errorf("token has been revoked")
+		return uuid.Nil, uuid.Nil, ErrTokenRevoked
 	}
 
 	if expiresAt := dbToken.ExpiresAt.Time; expiresAt.Before(time.Now().UTC()) {

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"os"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
+	"github.com/hatchet-dev/hatchet/pkg/auth/token"
 	"github.com/hatchet-dev/hatchet/pkg/config/loader"
 	"github.com/hatchet-dev/hatchet/pkg/config/server"
 	"github.com/hatchet-dev/hatchet/pkg/encryption"
@@ -282,17 +284,21 @@ func runCreateWorkerToken() error {
 		}
 	}
 
-	// Leave a token that is already there alone. The token this mints never
-	// expires and nothing revokes the one it would replace, so minting on every
-	// run leaves a trail of live credentials — and everything already holding
-	// the old one keeps using it, so the new one buys nothing.
-	//
-	// This command runs from a Job, and a Job re-runs whenever its Pod template
-	// changes or it is recreated after a failure. Being a no-op when the token
-	// exists is what makes those re-runs safe.
-	if exists && c.get("HATCHET_CLIENT_TOKEN") != "" {
-		fmt.Printf("%s already has HATCHET_CLIENT_TOKEN, leaving it unchanged\n", k8sClientConfigName)
-		return nil
+	if existing := c.get("HATCHET_CLIENT_TOKEN"); existing != "" {
+		_, _, validateErr := server.Auth.JWTManager.ValidateTenantToken(context.Background(), existing)
+
+		replace, err := replaceExistingWorkerToken(validateErr)
+
+		if err != nil {
+			return err
+		}
+
+		if !replace {
+			fmt.Printf("%s already has a HATCHET_CLIENT_TOKEN that this database accepts, leaving it unchanged\n", k8sClientConfigName)
+			return nil
+		}
+
+		fmt.Printf("the HATCHET_CLIENT_TOKEN in %s is not in this database, minting a replacement\n", k8sClientConfigName)
 	}
 
 	expiresAt := time.Now().UTC().Add(100 * 365 * 24 * time.Hour)
@@ -310,6 +316,10 @@ func runCreateWorkerToken() error {
 
 	c.set("HATCHET_CLIENT_TOKEN", defaultTok.Token)
 
+	// The resource still carries the resourceVersion it was read at, so a second
+	// pod that minted at the same time loses this update with a conflict instead
+	// of overwriting it. It exits non-zero, the Job retries it, and the retry
+	// reads the token this pod wrote and stops.
 	if exists {
 		err = c.updateResource(clientset)
 	} else {
@@ -321,6 +331,38 @@ func runCreateWorkerToken() error {
 	}
 
 	return nil
+}
+
+// replaceExistingWorkerToken reads the result of validating the token that is already in
+// the resource, and reports whether to mint a replacement for it.
+//
+// Only one answer is yes: the signature is good, but the "APIToken" row the token_id claim
+// names is gone. That is a token left behind by a database that was re-created, and no
+// amount of re-running the bootstrap Job recovers it on its own.
+//
+// Everything else is a no, because the token this command mints never expires and nothing
+// revokes the one it replaces. A database that is merely unreachable, a revoked token, and
+// a signature the current keyset cannot verify all fail here rather than mint. The engine
+// rejects the existing token in each of those cases too, so the cluster is already broken;
+// failing tells an operator that, and minting would hide it behind a second live credential.
+func replaceExistingWorkerToken(validateErr error) (bool, error) {
+	switch {
+	case validateErr == nil:
+		return false, nil
+	case stderrors.Is(validateErr, token.ErrTokenNotInDatabase):
+		return true, nil
+	case stderrors.Is(validateErr, token.ErrTokenRevoked):
+		return false, fmt.Errorf(
+			"the HATCHET_CLIENT_TOKEN in %s was revoked, and this command does not mint over a revocation. "+
+				"To issue a new worker token, delete the HATCHET_CLIENT_TOKEN key from %s and run this command again",
+			k8sClientConfigName, k8sClientConfigName,
+		)
+	default:
+		return false, fmt.Errorf(
+			"cannot tell whether the HATCHET_CLIENT_TOKEN in %s is still valid, so it was left alone: %w",
+			k8sClientConfigName, validateErr,
+		)
+	}
 }
 
 type configModifier struct {
