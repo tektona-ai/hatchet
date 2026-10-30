@@ -24,7 +24,10 @@ COPY ./frontend/app ./
 RUN npm run build
 
 # Stage 3: build the static fileserver
-FROM golang:1.26-alpine AS staticfileserver
+# --platform=$BUILDPLATFORM keeps the Go toolchain native on the builder, and
+# GOOS/GOARCH cross-compile for the target. Without it a multi-arch build
+# compiles the arm64 binary under emulation.
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS staticfileserver
 
 WORKDIR /app
 
@@ -35,7 +38,11 @@ ARG FIPS=false
 COPY go.mod go.sum ./
 COPY ./cmd/hatchet-staticfileserver/ ./cmd/hatchet-staticfileserver/
 
+ARG TARGETOS
+ARG TARGETARCH
+
 RUN if [ "$FIPS" = "true" ]; then export GOFIPS140=v1.0.0; fi && \
+    GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -ldflags="-w -s" -a -o hatchet-staticfileserver ./cmd/hatchet-staticfileserver && \
     if [ "$FIPS" = "true" ]; then \
       go version -m ./hatchet-staticfileserver | grep -q 'GOFIPS140=v1.0.0-c2097c7c$' && go version -m ./hatchet-staticfileserver | grep -Eq 'DefaultGODEBUG=.*fips140=on(,|$)' || { echo "hatchet-staticfileserver is not linked against the validated FIPS module"; exit 1; }; \
