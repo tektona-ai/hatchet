@@ -6,6 +6,8 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	natsmq "github.com/hatchet-dev/hatchet/internal/msgqueue/nats"
 )
 
 // TestPubSubSettingsInheritance checks the config backwards-compatibility
@@ -256,11 +258,117 @@ func TestPubSubNATSConnInheritance(t *testing.T) {
 			cf, err := LoadServerConfigFile()
 			require.NoError(t, err)
 
-			url, username, password := resolvePubSubNATSConn(cf)
+			url, username, password, _ := resolvePubSubNATSConn(cf)
 
 			assert.Equal(t, tc.wantURL, url)
 			assert.Equal(t, tc.wantUsername, username)
 			assert.Equal(t, tc.wantPassword, password)
+		})
+	}
+}
+
+// TestNATSConnConfigEnv checks the env names of the NATS credentials, TLS,
+// inbox and JetStream domain settings, and that the pub/sub inherits them with
+// the durable queue's URL.
+func TestNATSConnConfigEnv(t *testing.T) {
+	cases := []struct {
+		name           string
+		env            map[string]string
+		wantMQ         natsmq.ConnConfig
+		wantDomain     string
+		wantPubSubURL  string
+		wantPubSubConn natsmq.ConnConfig
+	}{
+		{
+			name: "tektona env names",
+			env: map[string]string{
+				"SERVER_MSGQUEUE_KIND":         "nats",
+				"SERVER_MSGQUEUE_NATS_URL":     "tls://nats:4222",
+				"TEKTONA_NATS_CREDS":           "/creds/nats.creds",
+				"TEKTONA_NATS_CA":              "/ca/ca.crt",
+				"TEKTONA_NATS_TLS_FIRST":       "true",
+				"TEKTONA_NATS_ALLOW_PLAINTEXT": "true",
+				"TEKTONA_NATS_JS_DOMAIN":       "hub",
+			},
+			wantMQ: natsmq.ConnConfig{
+				CredsFile:      "/creds/nats.creds",
+				CAFile:         "/ca/ca.crt",
+				TLSFirst:       true,
+				AllowPlaintext: true,
+			},
+			wantDomain:    "hub",
+			wantPubSubURL: "tls://nats:4222",
+			wantPubSubConn: natsmq.ConnConfig{
+				CredsFile:      "/creds/nats.creds",
+				CAFile:         "/ca/ca.crt",
+				TLSFirst:       true,
+				AllowPlaintext: true,
+			},
+		},
+		{
+			name: "server env names win over tektona env names",
+			env: map[string]string{
+				"SERVER_MSGQUEUE_KIND":                  "nats",
+				"SERVER_MSGQUEUE_NATS_URL":              "tls://nats:4222",
+				"SERVER_MSGQUEUE_NATS_CREDS_FILE":       "/server/nats.creds",
+				"TEKTONA_NATS_CREDS":                    "/tektona/nats.creds",
+				"SERVER_MSGQUEUE_NATS_CA_FILE":          "/server/ca.crt",
+				"TEKTONA_NATS_CA":                       "/tektona/ca.crt",
+				"SERVER_MSGQUEUE_NATS_INBOX_PREFIX":     "_INBOX_custom",
+				"SERVER_MSGQUEUE_NATS_JETSTREAM_DOMAIN": "server",
+				"TEKTONA_NATS_JS_DOMAIN":                "tektona",
+			},
+			wantMQ: natsmq.ConnConfig{
+				CredsFile:   "/server/nats.creds",
+				CAFile:      "/server/ca.crt",
+				InboxPrefix: "_INBOX_custom",
+			},
+			wantDomain:    "server",
+			wantPubSubURL: "tls://nats:4222",
+			wantPubSubConn: natsmq.ConnConfig{
+				CredsFile:   "/server/nats.creds",
+				CAFile:      "/server/ca.crt",
+				InboxPrefix: "_INBOX_custom",
+			},
+		},
+		{
+			// An explicit pub/sub URL takes the pub/sub's own settings only.
+			name: "explicit pubsub url does not inherit connection settings",
+			env: map[string]string{
+				"SERVER_MSGQUEUE_KIND":                        "nats",
+				"SERVER_MSGQUEUE_NATS_URL":                    "tls://durable:4222",
+				"TEKTONA_NATS_CREDS":                          "/creds/nats.creds",
+				"SERVER_MSGQUEUE_PUBSUB_NATS_URL":             "tls://pubsub:4222",
+				"SERVER_MSGQUEUE_PUBSUB_NATS_CREDS_FILE":      "/pubsub/nats.creds",
+				"SERVER_MSGQUEUE_PUBSUB_NATS_ALLOW_PLAINTEXT": "true",
+				"SERVER_MSGQUEUE_PUBSUB_NATS_INBOX_PREFIX":    "_INBOX_pubsub",
+			},
+			wantMQ:        natsmq.ConnConfig{CredsFile: "/creds/nats.creds"},
+			wantPubSubURL: "tls://pubsub:4222",
+			wantPubSubConn: natsmq.ConnConfig{
+				CredsFile:      "/pubsub/nats.creds",
+				AllowPlaintext: true,
+				InboxPrefix:    "_INBOX_pubsub",
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+
+			cf, err := LoadServerConfigFile()
+			require.NoError(t, err)
+
+			assert.Equal(t, tc.wantMQ, natsConnConfig(cf.MessageQueue.NATS))
+			assert.Equal(t, tc.wantDomain, cf.MessageQueue.NATS.JetStreamDomain)
+
+			url, _, _, conn := resolvePubSubNATSConn(cf)
+
+			assert.Equal(t, tc.wantPubSubURL, url)
+			assert.Equal(t, tc.wantPubSubConn, conn)
 		})
 	}
 }
