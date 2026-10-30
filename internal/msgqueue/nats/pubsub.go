@@ -63,6 +63,7 @@ type PubSubOpts struct {
 	password      string
 	tlsEnabled    bool
 	tlsRootCAFile string
+	conn          ConnConfig
 	subjectPrefix string
 }
 
@@ -114,6 +115,14 @@ func WithPubSubTLSRootCAFile(path string) PubSubOpt {
 	}
 }
 
+// WithPubSubConnConfig sets the credentials, TLS and inbox settings of the
+// connection.
+func WithPubSubConnConfig(c ConnConfig) PubSubOpt {
+	return func(opts *PubSubOpts) {
+		opts.conn = c
+	}
+}
+
 // WithPubSubSubjectPrefix sets the NATS subject prefix (default
 // "hatchet.pubsub"). Empty falls back to the default. No trimming or
 // validation: a bad prefix fails loudly via nats ErrBadSubject at startup.
@@ -152,13 +161,24 @@ func NewPubSub(fs ...PubSubOpt) (func() error, *PubSub, error) {
 	// log is the only drop signal.
 	asyncErrL := l.Sample(&zerolog.BurstSampler{Burst: 1, Period: time.Minute})
 
-	connectOpts := []natsgo.Option{
+	// tlsEnabled is a TLS-first connection, so it also satisfies the
+	// connectOptions check that a creds file only travels over TLS.
+	conn := opts.conn
+	if opts.tlsEnabled {
+		conn.TLSFirst = true
+
+		if opts.tlsRootCAFile != "" {
+			conn.CAFile = opts.tlsRootCAFile
+		}
+	}
+
+	connectOpts, err := connectOptions(l, "nats pubsub", opts.url, opts.username, opts.password, conn)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	connectOpts = append(connectOpts,
 		// Reconnect behavior is deliberately fixed rather than configurable.
-		// MaxReconnects(-1) retries forever: any finite limit permanently
-		// closes the connection once exhausted, leaving the engine without
-		// pub/sub until a process restart (the rabbitmq backend also retries
-		// indefinitely).
-		natsgo.MaxReconnects(-1),
 		// ReconnectBufSize(-1) disables the client-side buffer that would
 		// otherwise queue publishes during a disconnect and flush them on
 		// reconnect. These signals are latency optimizations over their
@@ -167,24 +187,8 @@ func NewPubSub(fs ...PubSubOpt) (func() error, *PubSub, error) {
 		// buffered publish flushed, polling would already have covered it;
 		// Pub fails fast while disconnected instead.
 		natsgo.ReconnectBufSize(-1),
-		// Empty credentials never reach the wire (the CONNECT payload omits
-		// empty user/pass fields), so UserInfo is safe to set unconditionally.
-		// Whether a username requires a password is the server's decision,
-		// enforced by the synchronous Connect below.
-		natsgo.UserInfo(opts.username, opts.password),
-		natsgo.DisconnectErrHandler(func(_ *natsgo.Conn, err error) {
-			if err != nil {
-				l.Warn().Err(err).Msg("nats pubsub disconnected")
-			} else {
-				l.Warn().Msg("nats pubsub disconnected")
-			}
-		}),
-		natsgo.ReconnectHandler(func(nc *natsgo.Conn) {
-			l.Info().Str("url", nc.ConnectedUrl()).Msg("nats pubsub reconnected")
-		}),
-		natsgo.ClosedHandler(func(_ *natsgo.Conn) {
-			l.Info().Msg("nats pubsub connection closed")
-		}),
+		// Replaces the generic handler from connectOptions: it adds the
+		// subscription's drop and pending counts, sampled.
 		natsgo.ErrorHandler(func(_ *natsgo.Conn, sub *natsgo.Subscription, err error) {
 			e := asyncErrL.Warn().Err(err)
 			if sub != nil {
@@ -200,20 +204,14 @@ func NewPubSub(fs ...PubSubOpt) (func() error, *PubSub, error) {
 			}
 			e.Msg("nats pubsub async error")
 		}),
-	}
+	)
 
 	if opts.tlsEnabled {
 		// Non-nil config: bare Secure() skips server verification per its
-		// doc comment.
-		connectOpts = append(connectOpts,
-			natsgo.Secure(&tls.Config{MinVersion: tls.VersionTLS13}),
-			natsgo.TLSHandshakeFirst(),
-		)
-
-		if opts.tlsRootCAFile != "" {
-			// RootCAs fails Connect on a missing or non-PEM file before any dial.
-			connectOpts = append(connectOpts, natsgo.RootCAs(opts.tlsRootCAFile))
-		}
+		// doc comment. connectOptions already added TLSHandshakeFirst and
+		// RootCAs; RootCAs fails Connect on a missing or non-PEM file before
+		// any dial.
+		connectOpts = append(connectOpts, natsgo.Secure(&tls.Config{MinVersion: tls.VersionTLS13}))
 	}
 
 	nc, err := natsgo.Connect(opts.url, connectOpts...)

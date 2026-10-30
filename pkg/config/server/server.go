@@ -658,6 +658,14 @@ type PubSubNATSConfigFile struct {
 	// SubjectPrefix is prepended (with a trailing ".") to topic names.
 	// Empty defaults to "hatchet.pubsub".
 	SubjectPrefix string `mapstructure:"subjectPrefix" json:"subjectPrefix,omitempty"`
+
+	// CredsFile, AllowPlaintext and InboxPrefix work as in NATSConfigFile.
+	// Like the username and password, they are inherited from the durable
+	// queue only together with its URL. TLS for the pub/sub is TLSEnabled and
+	// TLSRootCAFile above, and TLSEnabled counts as TLS for a creds file.
+	CredsFile      string `mapstructure:"credsFile" json:"credsFile,omitempty"`
+	AllowPlaintext bool   `mapstructure:"allowPlaintext" json:"allowPlaintext,omitempty" default:"false"`
+	InboxPrefix    string `mapstructure:"inboxPrefix" json:"inboxPrefix,omitempty"`
 }
 
 // NATSConfigFile configures the durable message queue when msgQueue.kind is
@@ -671,6 +679,33 @@ type NATSConfigFile struct {
 
 	Username string `mapstructure:"username" json:"username,omitempty"`
 	Password string `mapstructure:"password" json:"password,omitempty"`
+
+	// CredsFile is the path of a NATS credentials file (user JWT and nkey
+	// seed). It is read again on every reconnect, so a renewed file needs no
+	// restart. With a creds file set, the connection must use TLS (a tls://
+	// URL, a CA file or TLSFirst) unless AllowPlaintext is set.
+	CredsFile string `mapstructure:"credsFile" json:"credsFile,omitempty"`
+
+	// CAFile is the path of a PEM CA bundle that the server certificate must
+	// chain to. Setting it requires TLS. Empty verifies a tls:// server
+	// against the system roots.
+	CAFile string `mapstructure:"caFile" json:"caFile,omitempty"`
+
+	// TLSFirst starts TLS before reading the server INFO, for a server behind
+	// a TCP or TLS load balancer. The server must enable handshake_first.
+	TLSFirst bool `mapstructure:"tlsFirst" json:"tlsFirst,omitempty" default:"false"`
+
+	// AllowPlaintext lets a connection with a creds file run without TLS. The
+	// credentials then cross the network in plaintext.
+	AllowPlaintext bool `mapstructure:"allowPlaintext" json:"allowPlaintext,omitempty" default:"false"`
+
+	// InboxPrefix is the prefix of reply subjects. Empty defaults to
+	// "_INBOX_hatchet", so a server permission can grant "_INBOX_hatchet.>".
+	InboxPrefix string `mapstructure:"inboxPrefix" json:"inboxPrefix,omitempty"`
+
+	// JetStreamDomain sends every JetStream API call to $JS.<domain>.API.
+	// Empty sends them to $JS.API.
+	JetStreamDomain string `mapstructure:"jetStreamDomain" json:"jetStreamDomain,omitempty"`
 
 	// SubjectPrefix is prepended (with a trailing ".") to queue subjects.
 	// Empty defaults to "hatchet.mq".
@@ -1212,7 +1247,6 @@ func BindAllEnv(v *viper.Viper) {
 	// throughput options
 	_ = v.BindEnv("msgQueue.rabbitmq.qos", "SERVER_MSGQUEUE_RABBITMQ_QOS")
 
-	// pub/sub (all optional: inherit from the durable msgQueue settings when unset)
 	_ = v.BindEnv("msgQueue.nats.url", "SERVER_MSGQUEUE_NATS_URL")
 	_ = v.BindEnv("msgQueue.nats.username", "SERVER_MSGQUEUE_NATS_USERNAME")
 	_ = v.BindEnv("msgQueue.nats.password", "SERVER_MSGQUEUE_NATS_PASSWORD")
@@ -1224,7 +1258,16 @@ func BindAllEnv(v *viper.Viper) {
 	_ = v.BindEnv("msgQueue.nats.enableMessageRejection", "SERVER_MSGQUEUE_NATS_ENABLE_MESSAGE_REJECTION")
 	_ = v.BindEnv("msgQueue.nats.maxDeathCount", "SERVER_MSGQUEUE_NATS_MAX_DEATH_COUNT")
 	_ = v.BindEnv("msgQueue.nats.asyncPublish", "SERVER_MSGQUEUE_NATS_ASYNC_PUBLISH")
+	// The TEKTONA_NATS_* names are the ones that the Tektona charts set on every
+	// NATS client. The SERVER_* name wins when both are set.
+	_ = v.BindEnv("msgQueue.nats.credsFile", "SERVER_MSGQUEUE_NATS_CREDS_FILE", "TEKTONA_NATS_CREDS")
+	_ = v.BindEnv("msgQueue.nats.caFile", "SERVER_MSGQUEUE_NATS_CA_FILE", "TEKTONA_NATS_CA")
+	_ = v.BindEnv("msgQueue.nats.tlsFirst", "SERVER_MSGQUEUE_NATS_TLS_FIRST", "TEKTONA_NATS_TLS_FIRST")
+	_ = v.BindEnv("msgQueue.nats.allowPlaintext", "SERVER_MSGQUEUE_NATS_ALLOW_PLAINTEXT", "TEKTONA_NATS_ALLOW_PLAINTEXT")
+	_ = v.BindEnv("msgQueue.nats.inboxPrefix", "SERVER_MSGQUEUE_NATS_INBOX_PREFIX")
+	_ = v.BindEnv("msgQueue.nats.jetStreamDomain", "SERVER_MSGQUEUE_NATS_JETSTREAM_DOMAIN", "TEKTONA_NATS_JS_DOMAIN")
 
+	// pub/sub (all optional: inherit from the durable msgQueue settings when unset)
 	_ = v.BindEnv("msgQueue.pubSub.kind", "SERVER_MSGQUEUE_PUBSUB_KIND")
 	_ = v.BindEnv("msgQueue.pubSub.rabbitmq.url", "SERVER_MSGQUEUE_PUBSUB_RABBITMQ_URL")
 	_ = v.BindEnv("msgQueue.pubSub.rabbitmq.maxPubChans", "SERVER_MSGQUEUE_PUBSUB_RABBITMQ_MAX_PUB_CHANS")
@@ -1237,6 +1280,9 @@ func BindAllEnv(v *viper.Viper) {
 	_ = v.BindEnv("msgQueue.pubSub.nats.subjectPrefix", "SERVER_MSGQUEUE_PUBSUB_NATS_SUBJECT_PREFIX")
 	_ = v.BindEnv("msgQueue.pubSub.nats.tlsEnabled", "SERVER_MSGQUEUE_PUBSUB_NATS_TLS_ENABLED")
 	_ = v.BindEnv("msgQueue.pubSub.nats.tlsRootCAFile", "SERVER_MSGQUEUE_PUBSUB_NATS_TLS_ROOT_CA_FILE")
+	_ = v.BindEnv("msgQueue.pubSub.nats.credsFile", "SERVER_MSGQUEUE_PUBSUB_NATS_CREDS_FILE")
+	_ = v.BindEnv("msgQueue.pubSub.nats.allowPlaintext", "SERVER_MSGQUEUE_PUBSUB_NATS_ALLOW_PLAINTEXT")
+	_ = v.BindEnv("msgQueue.pubSub.nats.inboxPrefix", "SERVER_MSGQUEUE_PUBSUB_NATS_INBOX_PREFIX")
 	_ = v.BindEnv("runtime.singleQueueLimit", "SERVER_SINGLE_QUEUE_LIMIT")
 	_ = v.BindEnv("runtime.optimisticSchedulingEnabled", "SERVER_OPTIMISTIC_SCHEDULING_ENABLED")
 	_ = v.BindEnv("runtime.optimisticSchedulingSlots", "SERVER_OPTIMISTIC_SCHEDULING_SLOTS")

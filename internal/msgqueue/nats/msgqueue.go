@@ -114,6 +114,8 @@ type MessageQueueOpts struct {
 	url                    string
 	username               string
 	password               string
+	conn                   ConnConfig
+	jetStreamDomain        string
 	qos                    int
 	subjectPrefix          string
 	streamPrefix           string
@@ -157,6 +159,22 @@ func WithUsername(username string) MessageQueueOpt {
 func WithPassword(password string) MessageQueueOpt {
 	return func(opts *MessageQueueOpts) {
 		opts.password = password
+	}
+}
+
+// WithConnConfig sets the credentials, TLS and inbox settings of the
+// connection.
+func WithConnConfig(c ConnConfig) MessageQueueOpt {
+	return func(opts *MessageQueueOpts) {
+		opts.conn = c
+	}
+}
+
+// WithJetStreamDomain sends every JetStream API call to $JS.<domain>.API.
+// Empty sends them to $JS.API.
+func WithJetStreamDomain(domain string) MessageQueueOpt {
+	return func(opts *MessageQueueOpts) {
+		opts.jetStreamDomain = domain
 	}
 }
 
@@ -279,7 +297,12 @@ func New(fs ...MessageQueueOpt) (func() error, *MessageQueue, error) {
 	newLogger := opts.l.With().Str("service", "nats-msgqueue").Logger()
 	l := &newLogger
 
-	nc, err := natsgo.Connect(opts.url, connectOptions(l, "nats msgqueue", opts.username, opts.password)...)
+	connectOpts, err := connectOptions(l, "nats msgqueue", opts.url, opts.username, opts.password, opts.conn)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	nc, err := natsgo.Connect(opts.url, connectOpts...)
 
 	if err != nil {
 		return nil, nil, fmt.Errorf("could not connect to nats at %q: %w", opts.url, err)
@@ -333,7 +356,7 @@ func New(fs ...MessageQueueOpt) (func() error, *MessageQueue, error) {
 		)
 	}
 
-	js, err := jetstream.New(nc, jsOpts...)
+	js, err := newJetStream(nc, opts.jetStreamDomain, jsOpts...)
 
 	if err != nil {
 		cancel()
@@ -935,36 +958,6 @@ func hasStaticDLQ(q msgqueue.Queue) bool {
 	dlq := q.DLQ()
 
 	return dlq != nil && !dlq.IsAutoDLQ()
-}
-
-// connectOptions returns the nats.go options shared by the durable queue and
-// the pub/sub: retry forever, and log connection lifecycle transitions.
-func connectOptions(l *zerolog.Logger, name, username, password string) []natsgo.Option {
-	return []natsgo.Option{
-		// MaxReconnects(-1) retries forever: any finite limit permanently
-		// closes the connection once exhausted, leaving the engine without a
-		// message queue until a process restart.
-		natsgo.MaxReconnects(-1),
-		// Empty credentials never reach the wire (the CONNECT payload omits
-		// empty user/pass fields), so UserInfo is safe to set unconditionally.
-		natsgo.UserInfo(username, password),
-		natsgo.DisconnectErrHandler(func(_ *natsgo.Conn, err error) {
-			l.Warn().Err(err).Msgf("%s disconnected", name)
-		}),
-		natsgo.ReconnectHandler(func(nc *natsgo.Conn) {
-			l.Info().Str("url", nc.ConnectedUrl()).Msgf("%s reconnected", name)
-		}),
-		natsgo.ClosedHandler(func(_ *natsgo.Conn) {
-			l.Info().Msgf("%s connection closed", name)
-		}),
-		natsgo.ErrorHandler(func(_ *natsgo.Conn, sub *natsgo.Subscription, err error) {
-			subject := ""
-			if sub != nil {
-				subject = sub.Subject
-			}
-			l.Error().Err(err).Str("subject", subject).Msgf("%s async error", name)
-		}),
-	}
 }
 
 // sanitizeName maps a Hatchet queue name onto the character set NATS allows for
