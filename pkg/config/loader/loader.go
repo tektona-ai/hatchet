@@ -558,6 +558,8 @@ func createControllerLayer(dc *database.Layer, cf *server.ServerConfigFile, vers
 				natsmq.WithURL(cf.MessageQueue.NATS.URL),
 				natsmq.WithUsername(cf.MessageQueue.NATS.Username),
 				natsmq.WithPassword(cf.MessageQueue.NATS.Password),
+				natsmq.WithConnConfig(natsConnConfig(cf.MessageQueue.NATS)),
+				natsmq.WithJetStreamDomain(cf.MessageQueue.NATS.JetStreamDomain),
 				natsmq.WithSubjectPrefix(cf.MessageQueue.NATS.SubjectPrefix),
 				natsmq.WithStreamPrefix(cf.MessageQueue.NATS.StreamPrefix),
 				natsmq.WithLogger(&l),
@@ -1090,7 +1092,7 @@ func createPubSubV1(dc *database.Layer, cf *server.ServerConfigFile, l *zerolog.
 		ps = rmqps
 		cleanup = cleanupRmq
 	case "nats":
-		natsURL, natsUsername, natsPassword := resolvePubSubNATSConn(cf)
+		natsURL, natsUsername, natsPassword, natsConn := resolvePubSubNATSConn(cf)
 
 		if natsURL == "" {
 			return nil, nil, fmt.Errorf("using NATS as pubsub requires a URL to be set")
@@ -1102,6 +1104,7 @@ func createPubSubV1(dc *database.Layer, cf *server.ServerConfigFile, l *zerolog.
 			natsmq.WithPubSubPassword(natsPassword),
 			natsmq.WithPubSubTLSEnabled(cf.MessageQueue.PubSub.NATS.TLSEnabled),
 			natsmq.WithPubSubTLSRootCAFile(cf.MessageQueue.PubSub.NATS.TLSRootCAFile),
+			natsmq.WithPubSubConnConfig(natsConn),
 			natsmq.WithPubSubSubjectPrefix(cf.MessageQueue.PubSub.NATS.SubjectPrefix),
 			natsmq.WithPubSubLogger(l),
 		)
@@ -1144,19 +1147,32 @@ func resolvePubSubKindAndURL(cf *server.ServerConfigFile) (kind string, rabbitUR
 // inheriting the durable queue's when the pub/sub has none of its own, so
 // `msgQueue.kind: nats` needs no second block of credentials.
 //
-// The URL, username and password are inherited as a unit: taking the URL from
-// one config and credentials from the other would assemble a pair that was
-// never written down anywhere.
-func resolvePubSubNATSConn(cf *server.ServerConfigFile) (url, username, password string) {
-	url = cf.MessageQueue.PubSub.NATS.URL
-	username = cf.MessageQueue.PubSub.NATS.Username
-	password = cf.MessageQueue.PubSub.NATS.Password
+// The URL, username, password and connection settings are inherited as a
+// unit: taking the URL from one config and credentials from the other would
+// assemble a pair that was never written down anywhere.
+func resolvePubSubNATSConn(cf *server.ServerConfigFile) (url, username, password string, conn natsmq.ConnConfig) {
+	ps := cf.MessageQueue.PubSub.NATS
 
-	if url == "" && strings.EqualFold(cf.MessageQueue.Kind, "nats") {
-		return cf.MessageQueue.NATS.URL, cf.MessageQueue.NATS.Username, cf.MessageQueue.NATS.Password
+	if ps.URL == "" && strings.EqualFold(cf.MessageQueue.Kind, "nats") {
+		mq := cf.MessageQueue.NATS
+		return mq.URL, mq.Username, mq.Password, natsConnConfig(mq)
 	}
 
-	return url, username, password
+	return ps.URL, ps.Username, ps.Password, natsmq.ConnConfig{
+		CredsFile:      ps.CredsFile,
+		AllowPlaintext: ps.AllowPlaintext,
+		InboxPrefix:    ps.InboxPrefix,
+	}
+}
+
+func natsConnConfig(c server.NATSConfigFile) natsmq.ConnConfig {
+	return natsmq.ConnConfig{
+		CredsFile:      c.CredsFile,
+		CAFile:         c.CAFile,
+		TLSFirst:       c.TLSFirst,
+		AllowPlaintext: c.AllowPlaintext,
+		InboxPrefix:    c.InboxPrefix,
+	}
 }
 
 func getStrArr(v string) []string {

@@ -352,6 +352,12 @@ Variables marked with ⚠️ are conditionally required when specific features a
 | `SERVER_MSGQUEUE_NATS_ENABLE_MESSAGE_REJECTION`     | Stop redelivering messages past the max death count                                                        | `false`          |
 | `SERVER_MSGQUEUE_NATS_MAX_DEATH_COUNT`              | Max redeliveries before a message is rejected                                                              | `1000`           |
 | `SERVER_MSGQUEUE_NATS_ASYNC_PUBLISH`                | Pipeline publishes instead of awaiting a server ack per message (see below)                                | `false`          |
+| `SERVER_MSGQUEUE_NATS_CREDS_FILE`                   | Path of a NATS credentials file (user JWT and nkey seed), read again on every reconnect                    |                  |
+| `SERVER_MSGQUEUE_NATS_CA_FILE`                      | Path of a PEM CA bundle for the server certificate; setting it requires TLS                                |                  |
+| `SERVER_MSGQUEUE_NATS_TLS_FIRST`                    | Start TLS before reading the server INFO (the server must set `handshake_first`)                           | `false`          |
+| `SERVER_MSGQUEUE_NATS_ALLOW_PLAINTEXT`              | Allow a creds file over a connection without TLS (local development only)                                  | `false`          |
+| `SERVER_MSGQUEUE_NATS_INBOX_PREFIX`                 | Prefix of reply subjects (no trailing `.`)                                                                 | `_INBOX_hatchet` |
+| `SERVER_MSGQUEUE_NATS_JETSTREAM_DOMAIN`             | JetStream domain; every JetStream API call goes to `$JS.<domain>.API`                                      |                  |
 | `SERVER_MSGQUEUE_PUBSUB_KIND`                       | Pub/sub kind: `rabbitmq`, `postgres`, or `nats` (inherits `SERVER_MSGQUEUE_KIND` when unset)               |                  |
 | `SERVER_MSGQUEUE_PUBSUB_RABBITMQ_URL`               | Pub/sub RabbitMQ URL (inherits `SERVER_MSGQUEUE_RABBITMQ_URL` when unset; always uses its own connections) |                  |
 | `SERVER_MSGQUEUE_PUBSUB_RABBITMQ_MAX_PUB_CHANS`     | Pub/sub RabbitMQ max publish channels                                                                      | `10`             |
@@ -364,6 +370,9 @@ Variables marked with ⚠️ are conditionally required when specific features a
 | `SERVER_MSGQUEUE_PUBSUB_NATS_TLS_ENABLED`           | Pub/sub NATS: verified TLS with a TLS-first handshake (server must set `handshake_first`)                  | `false`          |
 | `SERVER_MSGQUEUE_PUBSUB_NATS_TLS_ROOT_CA_FILE`      | Pub/sub NATS PEM CA bundle for a private CA; requires `SERVER_MSGQUEUE_PUBSUB_NATS_TLS_ENABLED=true`       |                  |
 | `SERVER_MSGQUEUE_PUBSUB_NATS_SUBJECT_PREFIX`        | Pub/sub NATS subject prefix, joined to topic names with `.`                                                | `hatchet.pubsub` |
+| `SERVER_MSGQUEUE_PUBSUB_NATS_CREDS_FILE`            | Pub/sub NATS credentials file (see `SERVER_MSGQUEUE_NATS_CREDS_FILE`)                                      |                  |
+| `SERVER_MSGQUEUE_PUBSUB_NATS_ALLOW_PLAINTEXT`       | Pub/sub NATS plaintext opt-out (see `SERVER_MSGQUEUE_NATS_ALLOW_PLAINTEXT`)                                | `false`          |
+| `SERVER_MSGQUEUE_PUBSUB_NATS_INBOX_PREFIX`          | Pub/sub NATS reply subject prefix                                                                          | `_INBOX_hatchet` |
 | `SERVER_SINGLE_QUEUE_LIMIT`                         | Single queue limit                                                                                         | `100`            |
 
 ### NATS
@@ -416,6 +425,38 @@ point `SERVER_MSGQUEUE_PUBSUB_NATS_TLS_ROOT_CA_FILE` at a PEM CA bundle, which
 also applies when the client reconnects to rediscovered cluster peers. The CA
 file only takes effect with TLS enabled, so Hatchet refuses to start if it is
 set while `SERVER_MSGQUEUE_PUBSUB_NATS_TLS_ENABLED` is false.
+
+#### Credentials and TLS
+
+For a server in operator mode, point `SERVER_MSGQUEUE_NATS_CREDS_FILE` at a
+credentials file. The client reads the file again on every reconnect, so a
+process that renews the file needs no restart: the server closes the connection
+when the old JWT expires, and the client reconnects with the new one.
+
+With a credentials file set, Hatchet refuses to start unless the connection uses
+TLS: a `tls://` URL, `SERVER_MSGQUEUE_NATS_CA_FILE` or
+`SERVER_MSGQUEUE_NATS_TLS_FIRST`. A `tls://` URL without a CA file verifies the
+server against the system roots. Set `SERVER_MSGQUEUE_NATS_ALLOW_PLAINTEXT=true`
+only for local development, because the credentials then cross the network in
+plaintext.
+
+Replies use the inbox prefix `_INBOX_hatchet`, not the shared `_INBOX`, so a
+server permission can give Hatchet its own replies (`_INBOX_hatchet.>`) and no
+other client's. Set `SERVER_MSGQUEUE_NATS_JETSTREAM_DOMAIN` when the server runs
+JetStream in a domain, so that every JetStream API call goes to
+`$JS.<domain>.API`.
+
+The pub/sub inherits these settings with the durable queue's URL. With its own
+`SERVER_MSGQUEUE_PUBSUB_NATS_URL`, it takes only its own
+`SERVER_MSGQUEUE_PUBSUB_NATS_*` settings. The pub/sub's TLS settings are
+`SERVER_MSGQUEUE_PUBSUB_NATS_TLS_ENABLED` and
+`SERVER_MSGQUEUE_PUBSUB_NATS_TLS_ROOT_CA_FILE` (see above), and they apply in
+both cases. TLS enabled counts as TLS for a credentials file.
+
+The durable queue settings also read the names that Tektona sets on every NATS
+client: `TEKTONA_NATS_CREDS`, `TEKTONA_NATS_CA`, `TEKTONA_NATS_TLS_FIRST`,
+`TEKTONA_NATS_ALLOW_PLAINTEXT` and `TEKTONA_NATS_JS_DOMAIN`. The
+`SERVER_MSGQUEUE_NATS_*` name wins when both are set.
 
 #### Isolating installations
 
