@@ -23,18 +23,10 @@ func main() {
 	c := staticfileserver.NewStaticFileServer(*staticAssetDir, *basePath)
 
 	if *apiProxy != "" {
-		target, err := url.Parse(*apiProxy)
+		proxy, err := newAPIProxy(*apiProxy)
 		if err != nil {
 			log.Printf("invalid -api-proxy url: %s", err.Error())
 			os.Exit(1)
-		}
-
-		proxy := &httputil.ReverseProxy{
-			Rewrite: func(r *httputil.ProxyRequest) {
-				r.SetURL(target)
-				r.Out.Host = r.In.Host
-				r.SetXForwarded()
-			},
 		}
 
 		c.Handle("/api", proxy)
@@ -58,4 +50,31 @@ func envOrDefault(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// newAPIProxy returns a reverse proxy to rawURL. It keeps the incoming
+// X-Forwarded-For chain and appends the peer address, as nginx's
+// $proxy_add_x_forwarded_for does. Rewrite strips the incoming chain by
+// default, and without it the API sees every client behind an ingress as the
+// ingress address.
+func newAPIProxy(rawURL string) (*httputil.ReverseProxy, error) {
+	target, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, err
+	}
+
+	// url.Parse accepts "api:8080" as scheme "api", which would fail on every
+	// request instead of at startup.
+	if (target.Scheme != "http" && target.Scheme != "https") || target.Host == "" {
+		return nil, fmt.Errorf("%q must be an http:// or https:// URL with a host", rawURL)
+	}
+
+	return &httputil.ReverseProxy{
+		Rewrite: func(r *httputil.ProxyRequest) {
+			r.SetURL(target)
+			r.Out.Host = r.In.Host
+			r.Out.Header["X-Forwarded-For"] = r.In.Header["X-Forwarded-For"]
+			r.SetXForwarded()
+		},
+	}, nil
 }
