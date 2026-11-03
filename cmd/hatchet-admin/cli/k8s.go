@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/fatih/color"
@@ -98,7 +99,7 @@ func init() {
 		&k8sQuickstartOverwrite,
 		"overwrite",
 		false,
-		"whether existing configmap should be overwritten, if it exists",
+		"whether to replace the existing cookie secrets and keysets, if they exist. ADMIN_EMAIL and ADMIN_PASSWORD stay unchanged",
 	)
 
 	k8sCmd.AddCommand(k8sWorkerTokenCmd)
@@ -111,11 +112,68 @@ func init() {
 	)
 }
 
-type generatedConfig struct {
-	authCookieSecrets          string
-	encryptionMasterKeyset     string
-	encryptionJwtPrivateKeyset string
-	encryptionJwtPublicKeyset  string
+// quickstartUpdates returns only the keys that the config must change. An empty
+// result means that the config needs no write.
+func quickstartUpdates(get func(key string) string, overwrite bool) (map[string]string, error) {
+	keysets := []string{"SERVER_ENCRYPTION_MASTER_KEYSET", "SERVER_ENCRYPTION_JWT_PRIVATE_KEYSET", "SERVER_ENCRYPTION_JWT_PUBLIC_KEYSET"}
+
+	var missingKeysets []string
+
+	for _, key := range keysets {
+		if get(key) == "" {
+			missingKeysets = append(missingKeysets, key)
+		}
+	}
+
+	// The three keysets are one unit: new keysets make all stored data unreadable.
+	if !overwrite && len(missingKeysets) > 0 && len(missingKeysets) < len(keysets) {
+		return nil, fmt.Errorf("config has only some of the encryption keysets, missing %s: restore them from a backup, or pass --overwrite to replace all keysets and lose access to stored data", strings.Join(missingKeysets, ", "))
+	}
+
+	updates := map[string]string{}
+
+	if overwrite || get("SERVER_AUTH_COOKIE_SECRETS") == "" {
+		authCookieSecret1, err := random.Generate(16)
+		if err != nil {
+			return nil, err
+		}
+
+		authCookieSecret2, err := random.Generate(16)
+		if err != nil {
+			return nil, err
+		}
+
+		updates["SERVER_AUTH_COOKIE_SECRETS"] = authCookieSecret1 + " " + authCookieSecret2
+	}
+
+	if overwrite || len(missingKeysets) > 0 {
+		masterKeyBytes, privateEc256, publicEc256, _, err := encryption.GenerateLocalKeys()
+		if err != nil {
+			return nil, err
+		}
+
+		updates["SERVER_ENCRYPTION_MASTER_KEYSET"] = string(masterKeyBytes)
+		updates["SERVER_ENCRYPTION_JWT_PRIVATE_KEYSET"] = string(privateEc256)
+		updates["SERVER_ENCRYPTION_JWT_PUBLIC_KEYSET"] = string(publicEc256)
+	}
+
+	// --overwrite does not replace the admin login. The seed step sets a password
+	// only when it creates the user, so a new value here would not match the login.
+	if get("ADMIN_EMAIL") == "" {
+		updates["ADMIN_EMAIL"] = "admin@example.com"
+	}
+
+	if get("ADMIN_PASSWORD") == "" {
+		password, err := random.Generate(32)
+		if err != nil {
+			return nil, err
+		}
+
+		// The prefix guarantees the character classes that the seed step demands.
+		updates["ADMIN_PASSWORD"] = "Aa1" + password
+	}
+
+	return updates, nil
 }
 
 func runK8sQuickstart() error {
@@ -164,46 +222,20 @@ func runK8sQuickstart() error {
 		}
 	}
 
-	res := generatedConfig{
-		authCookieSecrets:          c.get("SERVER_AUTH_COOKIE_SECRETS"),
-		encryptionMasterKeyset:     c.get("SERVER_ENCRYPTION_MASTER_KEYSET"),
-		encryptionJwtPrivateKeyset: c.get("SERVER_ENCRYPTION_JWT_PRIVATE_KEYSET"),
-		encryptionJwtPublicKeyset:  c.get("SERVER_ENCRYPTION_JWT_PUBLIC_KEYSET"),
+	updates, err := quickstartUpdates(c.get, k8sQuickstartOverwrite)
+	if err != nil {
+		return err
 	}
 
-	if k8sQuickstartOverwrite || res.authCookieSecrets == "" {
-		// generate the random strings for SERVER_AUTH_COOKIE_SECRETS
-		authCookieSecret1, err := random.Generate(16)
-
-		if err != nil {
-			return err
-		}
-
-		authCookieSecret2, err := random.Generate(16)
-
-		if err != nil {
-			return err
-		}
-
-		res.authCookieSecrets = authCookieSecret1 + " " + authCookieSecret2
+	// This command runs from a Job on every install and upgrade.
+	if len(updates) == 0 {
+		fmt.Printf("%s is complete, leaving it unchanged\n", k8sQuickstartConfigName)
+		return nil
 	}
 
-	if k8sQuickstartOverwrite || res.encryptionMasterKeyset == "" || res.encryptionJwtPrivateKeyset == "" || res.encryptionJwtPublicKeyset == "" {
-		masterKeyBytes, privateEc256, publicEc256, _, generationErr := encryption.GenerateLocalKeys()
-		if generationErr != nil {
-			return generationErr
-		}
-
-		res.encryptionMasterKeyset = string(masterKeyBytes)
-		res.encryptionJwtPrivateKeyset = string(privateEc256)
-		res.encryptionJwtPublicKeyset = string(publicEc256)
+	for key, value := range updates {
+		c.set(key, value)
 	}
-
-	// create or update the config
-	c.set("SERVER_AUTH_COOKIE_SECRETS", res.authCookieSecrets)
-	c.set("SERVER_ENCRYPTION_MASTER_KEYSET", res.encryptionMasterKeyset)
-	c.set("SERVER_ENCRYPTION_JWT_PRIVATE_KEYSET", res.encryptionJwtPrivateKeyset)
-	c.set("SERVER_ENCRYPTION_JWT_PUBLIC_KEYSET", res.encryptionJwtPublicKeyset)
 
 	if exists {
 		err = c.updateResource(clientset)
